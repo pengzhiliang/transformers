@@ -1,0 +1,301 @@
+# Copyright (c) Meta Platforms, Inc. and affiliates.
+# Copyright 2023 The HuggingFace Inc. team. All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+import math
+from typing import Optional, Tuple, Union
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+from ...modeling_utils import PreTrainedModel
+from ...activations import ACT2FN
+from ...utils import logging
+from ..llama.modeling_llama import LlamaRMSNorm
+from .configuration_vibepod import VibePodDiffusionHeadConfig
+
+
+logger = logging.get_logger(__name__)
+
+
+def modulate(x, shift, scale):
+    """Apply modulation to input tensor."""
+    return x * (1 + scale) + shift
+
+
+class TimestepEmbedder(nn.Module):
+    """
+    Embeds scalar timesteps into vector representations.
+    
+    Args:
+        hidden_size (`int`): Size of the output embedding
+        frequency_embedding_size (`int`, optional): Size of the intermediate frequency embedding
+    """
+    def __init__(self, hidden_size, frequency_embedding_size=256):
+        super().__init__()
+        self.mlp = nn.Sequential(
+            nn.Linear(frequency_embedding_size, hidden_size, bias=False),
+            nn.SiLU(),
+            nn.Linear(hidden_size, hidden_size, bias=False),
+        )
+        self.frequency_embedding_size = frequency_embedding_size
+
+    @staticmethod
+    def timestep_embedding(t, dim, max_period=10000):
+        """
+        Create sinusoidal timestep embeddings.
+        
+        Args:
+            t (`torch.Tensor`): A 1-D Tensor of N indices, one per batch element.
+                            These may be fractional.
+            dim (`int`): The dimension of the output.
+            max_period (`int`, optional): Controls the minimum frequency of the embeddings.
+            
+        Returns:
+            `torch.Tensor`: An [N, D] Tensor of positional embeddings.
+        """
+        half = dim // 2
+        freqs = torch.exp(
+            -math.log(max_period) * torch.arange(start=0, end=half, dtype=torch.float32) / half
+        ).to(t.device)
+        args = t[:, None].float() * freqs[None]
+        embedding = torch.cat([torch.cos(args), torch.sin(args)], dim=-1)
+        if dim % 2:
+            embedding = torch.cat([embedding, torch.zeros_like(embedding[:, :1])], dim=-1)
+        return embedding.to(t.dtype)
+
+    def forward(self, t):
+        t_freq = self.timestep_embedding(t, self.frequency_embedding_size)
+        t_emb = self.mlp(t_freq)
+        return t_emb
+
+
+class FeedForwardNetwork(nn.Module):
+    """
+    Standard feed-forward network with SwiGLU activation.
+    
+    Args:
+        embed_dim (`int`): Input dimension
+        ffn_dim (`int`): Hidden dimension
+    """
+    def __init__(
+        self,
+        embed_dim,
+        ffn_dim,
+    ):
+        super().__init__()
+        self.embed_dim = embed_dim
+        self.gate_proj = nn.Linear(self.embed_dim, ffn_dim, bias=False)
+        self.up_proj = nn.Linear(self.embed_dim, ffn_dim, bias=False)
+        self.down_proj = nn.Linear(ffn_dim, self.embed_dim, bias=False)
+
+    def forward(self, x):
+        gate = self.gate_proj(x)
+        up = self.up_proj(x)
+        
+        # SwiGLU activation
+        gate = F.silu(gate)
+        return self.down_proj(gate * up)
+
+# class VibePodMLP(nn.Module):
+#     def __init__(self, config):
+#         super().__init__()
+#         self.config = config
+#         self.hidden_size = config.hidden_size
+#         self.intermediate_size = config.intermediate_size
+#         self.gate_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=False)
+#         self.up_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=False)
+#         self.down_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=False)
+#         self.act_fn = ACT2FN[config.hidden_act]
+
+#     def forward(self, x):
+#         down_proj = self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
+#         return down_proj
+    
+class HeadLayer(nn.Module):
+    """
+    A layer in the diffusion head.
+    
+    Args:
+        embed_dim (`int`): Input dimension
+        ffn_dim (`int`): Hidden dimension
+        cond_dim (`int`): Condition embedding dimension
+        norm_eps (`float`, optional): Epsilon for normalization
+    """
+    def __init__(
+        self,
+        embed_dim,
+        ffn_dim,
+        cond_dim,
+        norm_eps=1e-5,
+    ):
+        super().__init__()
+        self.embed_dim = embed_dim
+        self.cond_dim = cond_dim
+        self.ffn_dim = ffn_dim
+        self.ffn = FeedForwardNetwork(
+            self.embed_dim,
+            self.ffn_dim,
+        )
+        self.norm = LlamaRMSNorm(self.embed_dim, eps=norm_eps)
+        self.adaLN_modulation = nn.Sequential(
+            nn.SiLU(),
+            nn.Linear(cond_dim, 3 * self.embed_dim, bias=False)
+        )
+
+    def forward(self, x, c):
+        shift_ffn, scale_ffn, gate_ffn = self.adaLN_modulation(c).chunk(3, dim=-1)
+        x = x + gate_ffn * self.ffn(modulate(self.norm(x), shift_ffn, scale_ffn))
+        return x
+
+
+class FinalLayer(nn.Module):
+    """
+    Final layer in the diffusion head.
+    
+    Args:
+        hidden_size (`int`): Input dimension
+        output_size (`int`): Output dimension
+        cond_size (`int`): Condition embedding dimension
+        norm_eps (`float`, optional): Epsilon for normalization
+    """
+    def __init__(self, hidden_size, output_size, cond_size, norm_eps=1e-5):
+        super().__init__()
+        self.norm_final = LlamaRMSNorm(hidden_size, eps=norm_eps, elementwise_affine=False)
+        self.linear = nn.Linear(hidden_size, output_size, bias=False)
+        self.adaLN_modulation = nn.Sequential(
+            nn.SiLU(),
+            nn.Linear(cond_size, 2 * hidden_size, bias=False)
+        )
+
+    def forward(self, x, c):
+        shift, scale = self.adaLN_modulation(c).chunk(2, dim=-1)
+        x = modulate(self.norm_final(x), shift, scale)
+        x = self.linear(x)
+        return x
+
+
+class VibePodPredictionHead(nn.Module):
+    """
+    Prediction head for diffusion models in VibePod.
+    
+    Args:
+        config (`VibePodDiffusionHeadConfig`): Model configuration
+        latent_size (`int`, optional): Size of the latent space
+    """
+    def __init__(
+        self,
+        config,
+        latent_size=None,
+    ):
+        super().__init__()
+        self.config = config
+        self.cond_dim = config.hidden_size
+        latent_size = latent_size or config.latent_size
+        
+        self.noisy_images_proj = nn.Linear(latent_size, config.hidden_size, bias=False)
+        self.cond_proj = nn.Linear(config.hidden_size, self.cond_dim, bias=False)
+        self.t_embedder = TimestepEmbedder(self.cond_dim)
+        
+        ffn_dim = int(config.hidden_size * config.head_ffn_ratio)
+        
+        # Create the intermediate layers
+        self.layers = nn.ModuleList([
+            HeadLayer(
+                embed_dim=config.hidden_size,
+                ffn_dim=ffn_dim,
+                cond_dim=self.cond_dim,
+                norm_eps=config.rms_norm_eps
+            )
+            for _ in range(config.head_layers)
+        ])
+        
+        # Final layer for output
+        self.final_layer = FinalLayer(
+            hidden_size=config.hidden_size, 
+            output_size=latent_size,
+            cond_size=self.cond_dim,
+            norm_eps=config.rms_norm_eps
+        )
+        
+        self.initialize_weights()
+
+    def initialize_weights(self):
+        """Initialize the weights of the model."""
+        # Initialize timestep embedder
+        nn.init.normal_(self.t_embedder.mlp[0].weight, std=0.02)
+        nn.init.normal_(self.t_embedder.mlp[2].weight, std=0.02)
+
+        # Zero-out adaLN modulation layers
+        for layer in self.layers:
+            nn.init.constant_(layer.adaLN_modulation[-1].weight, 0)
+
+        # Zero-out output layers
+        nn.init.constant_(self.final_layer.adaLN_modulation[-1].weight, 0)
+        nn.init.constant_(self.final_layer.linear.weight, 0)
+
+    def forward(
+        self,
+        noisy_images,
+        timesteps,
+        condition,
+    ):
+        """
+        Forward pass of the prediction head.
+        
+        Args:
+            noisy_images (`torch.Tensor`): Noisy images/latents to denoise
+            timesteps (`torch.Tensor`): Timesteps for diffusion
+            condition (`torch.Tensor`): Conditioning information
+            
+        Returns:
+            `torch.Tensor`: The predicted noise/velocity
+        """
+        x = self.noisy_images_proj(noisy_images)
+        t = self.t_embedder(timesteps)
+        condition = self.cond_proj(condition)
+        c = condition + t
+        
+        for layer in self.layers:
+            x = layer(x, c)
+            
+        x = self.final_layer(x, c)
+        return x
+
+
+class VibePodDiffusionHeadModel(PreTrainedModel):
+    """
+    Diffusion head model for VibePod.
+    
+    Args:
+        config (`VibePodDiffusionHeadConfig`): Model configuration
+    """
+    config_class = VibePodDiffusionHeadConfig
+    
+    def __init__(self, config):
+        super().__init__(config)
+        
+        self.speech_prediction_head = VibePodPredictionHead(
+            config,
+            latent_size=config.speech_vae_dim,
+        )
+    
+    def forward(
+        self,
+        noisy_latents,
+        timesteps,
+        condition,
+    ):
+        return self.speech_prediction_head(noisy_latents, timesteps, condition)
