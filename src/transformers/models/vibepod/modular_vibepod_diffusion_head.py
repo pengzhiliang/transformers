@@ -23,13 +23,36 @@ import torch.nn.functional as F
 from ...modeling_utils import PreTrainedModel
 from ...activations import ACT2FN
 from ...utils import logging
-from ..llama.modeling_llama import LlamaRMSNorm
+# from ..llama.modeling_llama import LlamaRMSNorm
 from .configuration_vibepod import VibePodDiffusionHeadConfig
 
 
 logger = logging.get_logger(__name__)
 
 
+class RMSNorm(nn.Module):
+    def __init__(self, dim: int, eps: float = 1e-6, elementwise_affine=True, memory_efficient=False):
+        super().__init__()
+        self.dim = dim
+        self.eps = eps
+        self.elementwise_affine = elementwise_affine
+        if self.elementwise_affine:
+            self.weight = nn.Parameter(torch.ones(dim))
+        else:
+            self.register_parameter('weight', None)
+
+    def _norm(self, x):
+        return x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
+
+    def forward(self, x):
+        output = self._norm(x.float()).type_as(x)
+        if self.weight is not None:
+            output = output * self.weight
+        return output
+
+    def extra_repr(self) -> str:
+        return f'dim={self.dim}, eps={self.eps}, elementwise_affine={self.elementwise_affine}'
+    
 def modulate(x, shift, scale):
     """Apply modulation to input tensor."""
     return x * (1 + scale) + shift
@@ -149,7 +172,7 @@ class HeadLayer(nn.Module):
             self.embed_dim,
             self.ffn_dim,
         )
-        self.norm = LlamaRMSNorm(self.embed_dim, eps=norm_eps)
+        self.norm = RMSNorm(self.embed_dim, eps=norm_eps)
         self.adaLN_modulation = nn.Sequential(
             nn.SiLU(),
             nn.Linear(cond_dim, 3 * self.embed_dim, bias=False)
@@ -173,7 +196,7 @@ class FinalLayer(nn.Module):
     """
     def __init__(self, hidden_size, output_size, cond_size, norm_eps=1e-5):
         super().__init__()
-        self.norm_final = LlamaRMSNorm(hidden_size, eps=norm_eps, elementwise_affine=False)
+        self.norm_final = RMSNorm(hidden_size, eps=norm_eps, elementwise_affine=False)
         self.linear = nn.Linear(hidden_size, output_size, bias=False)
         self.adaLN_modulation = nn.Sequential(
             nn.SiLU(),

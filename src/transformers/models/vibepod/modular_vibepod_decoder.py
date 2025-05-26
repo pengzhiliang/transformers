@@ -19,7 +19,7 @@ from ..auto import AutoModel, AutoModelForCausalLM
 
 from ..qwen2.modeling_qwen2 import Qwen2MLP, Qwen2Attention, Qwen2DecoderLayer, Qwen2Model
 
-from .configuration_vibepod import VibePodDecoderConfig
+# from .configuration_vibepod import VibePodDecoderConfig
 
 logger = logging.get_logger(__name__)
 
@@ -36,7 +36,7 @@ logger = logging.get_logger(__name__)
 #     def __init__(self, config: VibePodDecoderConfig, layer_idx: int):
 #         super().__init__(config, layer_idx)
 
-class VibePodDecoder(Qwen2Model):
-    def __init__(self, config: VibePodDecoderConfig):
-        super().__init__(config)
+# class VibePodDecoder(Qwen2Model):
+#     def __init__(self, config: VibePodDecoderConfig):
+#         super().__init__(config)
         

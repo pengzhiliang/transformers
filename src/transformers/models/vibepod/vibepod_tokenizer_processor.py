@@ -103,7 +103,7 @@ class AudioNormalizer:
 
 
 # Change from ProcessorMixin to FeatureExtractionMixin which is designed for single components
-class VibePodProcessor(FeatureExtractionMixin):
+class VibePodTokenizerProcessor(FeatureExtractionMixin):
     """
     Processor for VibePod acoustic tokenizer models.
     
@@ -482,7 +482,5 @@ class VibePodProcessor(FeatureExtractionMixin):
         
         return audio
 
-# Backward compatibility alias
-VibePodTokenizerProcessor = VibePodProcessor
 
-__all__ = ["VibePodProcessor", "VibePodTokenizerProcessor", "AudioNormalizer"]
+__all__ = ["VibePodTokenizerProcessor", "AudioNormalizer"]

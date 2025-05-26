@@ -1,10 +1,10 @@
-from transformers.models.vibepod.vibepod_tokenizer_processor import VibePodProcessor
+from transformers.models.vibepod.vibepod_tokenizer_processor import VibePodTokenizerProcessor
 from transformers.models.vibepod.modular_vibepod_tokenizer import VibePodAcousticTokenizerModel, VibePodSemanticTokenizerModel
 
 import numpy as np
 
 # 初始化
-processor = VibePodProcessor(normalize_audio=True)
+processor = VibePodTokenizerProcessor(normalize_audio=True)
 # model = VibePodAcousticTokenizerModel.from_pretrained("/tmp/viebpod_acoustic_tokenizer")
 model = VibePodSemanticTokenizerModel.from_pretrained("/tmp/viebpod_semantic_tokenizer")
 

@@ -8,6 +8,9 @@ if TYPE_CHECKING:
     from .configuration_vibepod import *
     from .modular_vibepod_tokenizer import *
     from .vibepod_tokenizer_processor import *
+    from .vibepod_processor import *
+    from .modular_vibepod_text_tokenizer import *
+    from .modeling_vibepod import *
 else:
     import sys
 

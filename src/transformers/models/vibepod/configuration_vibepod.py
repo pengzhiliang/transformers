@@ -18,6 +18,7 @@ from typing import Dict, List, Optional, Tuple
 from ...configuration_utils import PretrainedConfig 
 from ...utils import logging
 
+from ..qwen2.configuration_qwen2 import Qwen2Config
 
 logger = logging.get_logger(__name__)
 
@@ -176,88 +177,13 @@ class VibePodDiffusionHeadConfig(PretrainedConfig):
         
         super().__init__(**kwargs)
 
-class VibePodDecoderConfig(PretrainedConfig):
-    model_type = "vibepod"
-    base_config_key = 'decoder'
-
-    # Default tensor parallel plan for base model `Qwen2`
-    base_model_tp_plan = {
-        "layers.*.self_attn.q_proj": "colwise",
-        "layers.*.self_attn.k_proj": "colwise",
-        "layers.*.self_attn.v_proj": "colwise",
-        "layers.*.self_attn.o_proj": "rowwise",
-        "layers.*.mlp.gate_proj": "colwise",
-        "layers.*.mlp.up_proj": "colwise",
-        "layers.*.mlp.down_proj": "rowwise",
-    }
-    base_model_pp_plan = {
-        "embed_tokens": (["input_ids"], ["inputs_embeds"]),
-        "layers": (["hidden_states", "attention_mask"], ["hidden_states"]),
-        "norm": (["hidden_states"], ["hidden_states"]),
-    }
-
-    def __init__(
-        self,
-        vocab_size=151936,
-        hidden_size=4096,
-        intermediate_size=22016,
-        num_hidden_layers=32,
-        num_attention_heads=32,
-        num_key_value_heads=32,
-        hidden_act="silu",
-        max_position_embeddings=32768,
-        initializer_range=0.02,
-        rms_norm_eps=1e-6,
-        use_cache=True,
-        tie_word_embeddings=False,
-        rope_theta=10000.0,
-        rope_scaling=None,
-        use_sliding_window=False,
-        sliding_window=4096,
-        max_window_layers=28,
-        attention_dropout=0.0,
-        **kwargs,
-    ):
-        self.vocab_size = vocab_size
-        self.max_position_embeddings = max_position_embeddings
-        self.hidden_size = hidden_size
-        self.intermediate_size = intermediate_size
-        self.num_hidden_layers = num_hidden_layers
-        self.num_attention_heads = num_attention_heads
-        self.use_sliding_window = use_sliding_window
-        self.sliding_window = sliding_window  # we check `use_sliding_window` in the modeling code
-        self.max_window_layers = max_window_layers
-
-        # for backward compatibility
-        if num_key_value_heads is None:
-            num_key_value_heads = num_attention_heads
-
-        self.num_key_value_heads = num_key_value_heads
-        self.hidden_act = hidden_act
-        self.initializer_range = initializer_range
-        self.rms_norm_eps = rms_norm_eps
-        self.use_cache = use_cache
-        self.rope_theta = rope_theta
-        self.rope_scaling = rope_scaling
-        self.attention_dropout = attention_dropout
-        # Validate the correctness of rotary position embeddings parameters
-        # BC: if there is a 'type' field, move it to 'rope_type'.
-        if self.rope_scaling is not None and "type" in self.rope_scaling:
-            self.rope_scaling["rope_type"] = self.rope_scaling["type"]
-        rope_config_validation(self)
-
-        super().__init__(
-            tie_word_embeddings=tie_word_embeddings,
-            **kwargs,
-        )
-
 class VibePodConfig(PretrainedConfig):
     model_type = "vibepod"
     sub_configs = {
-        "acoustic_tokenizer": VibePodAcousticTokenizerConfig, 
-        "semantic_tokenizer": VibePodSemanticTokenizerConfig,
-        "decoder": VibePodDecoderConfig,
-        "diffusion_head": VibePodDiffusionHeadConfig,
+        "acoustic_tokenizer_config": VibePodAcousticTokenizerConfig, 
+        "semantic_tokenizer_config": VibePodSemanticTokenizerConfig,
+        "decoder_config": Qwen2Config,
+        "diffusion_head_config": VibePodDiffusionHeadConfig,
     }
     # keys_to_ignore_at_inference = ["past_key_values"]
 
@@ -267,87 +193,48 @@ class VibePodConfig(PretrainedConfig):
         semantic_tokenizer_config=None,
         decoder_config=None,
         diffusion_head_config=None,
-          
-        # Multi-modal parameters
-        batch_size: Optional[int] = None,
-        tokens_per_sample: Optional[int] = None,
-        model_parallel_size: int = 1,
-        
-        # Head configuration
-        head_layers: int = 4,
-        head_ffn_ratio: float = 3.0,
-        
-        # VAE parameters
-        vae_model: Optional[str] = None,
-        use_vae_mode: bool = False,
-        
-        # Connector and image parameters
-        connector: str = "simple",
-        image_size: Optional[int] = None,
-        latent_query_num: Optional[int] = None,
-        input_size: int = 16,
-        latent_size: int = 16,
-        
-        # Speech parameters
-        speech_tokenizer: Optional[str] = None,
-        speech_vae_dim: Optional[int] = None,
-        speech_semantic_tokenizer: Optional[str] = None,
-        speech_semantic_vae_dim: Optional[int] = None,
-        
-        # Additional config parameters from PretrainedConfig
-        pad_token_id: Optional[int] = None,
-        bos_token_id: Optional[int] = None,
-        eos_token_id: Optional[int] = None,
         **kwargs
     ):
-        if isinstance(acoustic_tokenizer_config, dict):
-            self.acoustic_tokenizer_config = self.sub_configs["acoustic_tokenizer"](**acoustic_tokenizer_config)
-        elif acoustic_tokenizer_config is None:
-            self.acoustic_tokenizer_config = self.sub_configs["acoustic_tokenizer"]()
 
-        if isinstance(semantic_tokenizer_config, dict):
-            self.semantic_tokenizer_config = self.sub_configs["semantic_tokenizer"](**semantic_tokenizer_config)
-        elif semantic_tokenizer_config is None:
-            self.semantic_tokenizer_config = self.sub_configs["semantic_tokenizer"](**kwargs)
-        
-        if isinstance(decoder_config, dict):
-            self.decoder_config = self.sub_configs["decoder"](**decoder_config)
-        elif decoder_config is None:
-            self.decoder_config = self.sub_configs["decoder"](**kwargs)
+        if acoustic_tokenizer_config is None:
+            self.acoustic_tokenizer_config = self.sub_configs["acoustic_tokenizer_config"]()
+        elif isinstance(acoustic_tokenizer_config, dict):
+            # If a dictionary is provided, instantiate the config class with it
+            self.acoustic_tokenizer_config = self.sub_configs["acoustic_tokenizer_config"](**acoustic_tokenizer_config)
+        elif isinstance(acoustic_tokenizer_config, VibePodAcousticTokenizerConfig):
+            # If an instance of the config class is provided
+            self.acoustic_tokenizer_config = acoustic_tokenizer_config
 
-        if isinstance(diffusion_head_config, dict):
-            self.diffusion_head_config = self.sub_configs["diffusion_head"](**diffusion_head_config)
-        elif diffusion_head_config is None:
-            self.diffusion_head_config = self.sub_configs["diffusion_head"](**kwargs)
+        if semantic_tokenizer_config is None:
+            self.semantic_tokenizer_config = self.sub_configs["semantic_tokenizer_config"]()
+        elif isinstance(semantic_tokenizer_config, dict):
+            # If a dictionary is provided, instantiate the config class with it
+            self.semantic_tokenizer_config = self.sub_configs["semantic_tokenizer_config"](**semantic_tokenizer_config)
+        elif isinstance(semantic_tokenizer_config, VibePodSemanticTokenizerConfig):
+            # If an instance of the config class is provided
+            self.semantic_tokenizer_config = semantic_tokenizer_config
 
-        # LLM architecture parameters
-        self.dim = dim
-        self.n_layers = n_layers
-        self.hidden_dim = hidden_dim
-        self.n_heads = n_heads
-        self.n_kv_heads = n_kv_heads
-        self.vocab_size = vocab_size
-        self.max_batch_size = max_batch_size
-        self.max_seq_len = max_seq_len
-        self.rope_theta = rope_theta
-        self.norm_eps = norm_eps
-        
-        # VAE parameters
-        self.vae_model = vae_model
-        self.use_vae_mode = use_vae_mode
-        
-        # Connector and image parameters
-        self.connector = connector
-        self.image_size = image_size
-        self.latent_query_num = latent_query_num
-        self.input_size = input_size
-        self.latent_size = latent_size
-        
-        # Speech parameters
-        self.speech_tokenizer = speech_tokenizer
-        self.speech_vae_dim = speech_vae_dim
-        self.speech_semantic_tokenizer = speech_semantic_tokenizer
-        self.speech_semantic_vae_dim = speech_semantic_vae_dim
+        if decoder_config is None:
+            self.decoder_config = self.sub_configs["decoder_config"]()
+        elif isinstance(decoder_config, dict):
+            # If a dictionary is provided, instantiate the config class with it
+            self.decoder_config = self.sub_configs["decoder_config"](**decoder_config)
+        elif isinstance(decoder_config, Qwen2Config):
+            # If an instance of the config class is provided
+            self.decoder_config = decoder_config
+
+        if diffusion_head_config is None:
+            self.diffusion_head_config = self.sub_configs["diffusion_head_config"]()
+        elif isinstance(diffusion_head_config, dict):
+            # If a dictionary is provided, instantiate the config class with it
+            self.diffusion_head_config = self.sub_configs["diffusion_head_config"](**diffusion_head_config)
+        elif isinstance(diffusion_head_config, VibePodDiffusionHeadConfig):
+            # If an instance of the config class is provided
+            self.diffusion_head_config = diffusion_head_config
+
+        # other parameters
+        self.acostic_vae_dim = getattr(self.acoustic_tokenizer_config, 'vae_dim', 64)
+        self.semantic_vae_dim = getattr(self.semantic_tokenizer_config, 'vae_dim', 128)
 
         super().__init__(**kwargs)
 
