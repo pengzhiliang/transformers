@@ -33,7 +33,7 @@ from ...utils import LossKwargs, auto_docstring, can_return_tuple, is_torchdynam
 from ..auto import AutoModel
 from ..llama.modeling_llama import LlamaRMSNorm
 from ..qwen2.modeling_qwen2 import Qwen2MLP, Qwen2Attention, Qwen2DecoderLayer, Qwen2Model
-from .modular_vibepod_tokenizer import VibePodAcousticTokenizerModel, VibePodSemanticTokenizerModel
+from .modular_vibepod_tokenizer import VibePodTokenizerStreamingCache, VibePodAcousticTokenizerModel, VibePodSemanticTokenizerModel
 from .modular_vibepod_diffusion_head import VibePodPredictionHead, VibePodDiffusionHeadModel
 from .schedule.dpm_solver import DPMSolverMultistepScheduler
 
@@ -161,6 +161,9 @@ class VibePodForConditionalGeneration(VibePodPreTrainedModel, GenerationMixin):
         
         # Initialize the base model
         self.model = VibePodModel(config)
+        
+        # inference configuration
+        self.ddpm_inference_steps = config.diffusion_head_config.ddpm_num_inference_steps
 
         # Initialize weights and apply final processing
         self.post_init()
@@ -189,6 +192,9 @@ class VibePodForConditionalGeneration(VibePodPreTrainedModel, GenerationMixin):
         """Set the speech tokenizers used for encoding and decoding speech."""
         self.model.set_speech_tokenizers(acoustic_tokenizer, semantic_tokenizer)
     
+    def set_ddpm_inference_steps(self, num_steps=None):
+        self.ddpm_inference_steps = num_steps or self.config.diffusion_head_config.ddpm_num_inference_steps
+
     def _process_speech_inputs(self, speech_tensors, speech_masks, speech_type="audio"):
         """Process speech inputs through tokenizers and connectors."""
         with torch.no_grad():
@@ -286,7 +292,7 @@ class VibePodForConditionalGeneration(VibePodPreTrainedModel, GenerationMixin):
     
     @torch.no_grad()
     def sample_speech_tokens(self, condition, neg_condition, cfg_scale=3.0):
-        self.model.noise_scheduler.set_timesteps(self.config.diffusion_head_config.ddpm_num_inference_steps)
+        self.model.noise_scheduler.set_timesteps(self.ddpm_inference_steps)
         condition = torch.cat([condition, neg_condition], dim=0)
         speech = torch.randn(condition.shape[0], self.config.acostic_vae_dim).to(condition)
         for t in self.model.noise_scheduler.timesteps:
@@ -406,6 +412,11 @@ class VibePodForConditionalGeneration(VibePodPreTrainedModel, GenerationMixin):
         speech_latents = [[]]  # Store latents for each speech segment
         speech_segment_index = 0 if is_speech_mode else -1
         
+        # Initialize separate streaming caches for acoustic and semantic tokenizers
+        acoustic_cache = VibePodTokenizerStreamingCache()
+        semantic_cache = VibePodTokenizerStreamingCache()
+        sample_indices = torch.tensor([0], device=device)  # Single sample for now
+        
         # Generation loop
         for idx in tqdm(range(max_new_tokens), disable=not verbose):
             # Forward pass for positive prompt
@@ -436,6 +447,9 @@ class VibePodForConditionalGeneration(VibePodPreTrainedModel, GenerationMixin):
             if next_token == speech_end_id:
                 is_speech_mode = False
                 speech_token_count = 0
+                # Clear both streaming caches when speech ends
+                acoustic_cache = VibePodTokenizerStreamingCache()
+                semantic_cache = VibePodTokenizerStreamingCache()
             elif next_token == speech_begin_id:
                 is_speech_mode = True
                 speech_token_count = 0
@@ -453,6 +467,10 @@ class VibePodForConditionalGeneration(VibePodPreTrainedModel, GenerationMixin):
                         output_hidden_states=True,
                     )
                     neg_past_key_values = neg_outputs.past_key_values
+                
+                # Clear both streaming caches for new speech segment
+                acoustic_cache = VibePodTokenizerStreamingCache()
+                semantic_cache = VibePodTokenizerStreamingCache()
             
             # Handle text generation
             if not is_speech_mode or next_token == speech_begin_id or next_token == speech_end_id:
@@ -492,22 +510,23 @@ class VibePodForConditionalGeneration(VibePodPreTrainedModel, GenerationMixin):
                 
                 speech_latents[speech_segment_index].append(speech_latent)
                 
-                # Decode to audio and encode to semantic features
-                init_streaming = (speech_token_count == 0)
-                
-                # Decode acoustic latent to audio
+                # Decode acoustic latent to audio using acoustic streaming cache
                 scaled_latent = speech_latent.unsqueeze(0) / self.model.speech_scaling_factor - self.model.speech_bias_factor
                 audio_chunk = self.model.acoustic_tokenizer.decode(
                     scaled_latent,
-                    streaming=True,
-                    init_streaming_state=init_streaming
+                    cache=acoustic_cache,  # Use acoustic-specific cache
+                    sample_indices=sample_indices,
+                    use_cache=True,
+                    debug=False
                 ).squeeze(0)
                 
-                # Encode audio to semantic features
+                # Encode audio to semantic features using semantic streaming cache
                 semantic_output = self.model.semantic_tokenizer.encode(
                     audio_chunk.unsqueeze(0),
-                    streaming=True,
-                    init_streaming_state=init_streaming
+                    cache=semantic_cache,  # Use semantic-specific cache
+                    sample_indices=sample_indices,
+                    use_cache=True,
+                    debug=False
                 )
                 semantic_features = semantic_output.mean.squeeze(0)
                 
@@ -525,7 +544,7 @@ class VibePodForConditionalGeneration(VibePodPreTrainedModel, GenerationMixin):
             if latent_list:
                 speech_latent = torch.cat(latent_list, dim=0)
                 if not return_latent:
-                    # Decode latents to audio
+                    # Decode latents to audio (non-streaming for final output)
                     scaled_latents = speech_latent.unsqueeze(0) / self.model.speech_scaling_factor - self.model.speech_bias_factor
                     audio = self.model.acoustic_tokenizer.decode(scaled_latents)
                     output_speech.append(audio.squeeze(0))

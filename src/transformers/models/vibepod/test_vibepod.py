@@ -141,67 +141,6 @@ def read_audio(audio_path: str, target_sr: int = 24000) -> np.ndarray:
     return wav.astype(np.float32)
 
 
-def convert_json_to_script(json_file: str) -> Tuple[str, List[int]]:
-    """
-    Convert JSON format to script format.
-    Expected JSON format:
-    [
-        {"speaker": "1", "text": "Hello everyone..."},
-        {"speaker": "2", "text": "Great to be here..."}
-    ]
-    """
-    with open(json_file, 'r') as f:
-        data = json.load(f)
-    
-    all_speakers = set()
-    script_lines = []
-    
-    for item in data:
-        speaker = item.get('speaker')
-        text = item.get('text')
-        if speaker and text:
-            all_speakers.add(int(speaker))
-            script_lines.append(f"Speaker {speaker}: {text}")
-    
-    return "\n".join(script_lines), sorted(list(all_speakers))
-
-
-def convert_text_to_script(text_file: str) -> Tuple[str, List[int]]:
-    """
-    Convert text file to script format.
-    Supports:
-    1. Already formatted as "Speaker X: text"
-    2. Plain text (assigns to Speaker 1)
-    """
-    with open(text_file, 'r') as f:
-        lines = f.readlines()
-    
-    all_speakers = set()
-    script_lines = []
-    
-    for line in lines:
-        line = line.strip()
-        if not line:
-            continue
-            
-        if line.startswith("Speaker"):
-            try:
-                speaker_part, text = line.split(":", 1)
-                speaker_id = int(speaker_part.split()[1])
-                all_speakers.add(speaker_id)
-                script_lines.append(f"Speaker {speaker_id}: {text.strip()}")
-            except:
-                # If parsing fails, treat as plain text
-                all_speakers.add(1)
-                script_lines.append(f"Speaker 1: {line}")
-        else:
-            # Plain text - assign to Speaker 1
-            all_speakers.add(1)
-            script_lines.append(f"Speaker 1: {line}")
-    
-    return "\n".join(script_lines), sorted(list(all_speakers))
-
-
 def main():
     args = parse_args()
     
@@ -217,8 +156,8 @@ def main():
     else:
         dtype = torch.bfloat16
     
-    logger.info(f"Loading model from {args.model_path}")
-    logger.info(f"Using device: {device}, dtype: {dtype}")
+    print(f"Loading model from {args.model_path}")
+    print(f"Using device: {device}, dtype: {dtype}")
     
     # Load processor (which handles tokenizer and audio processor)
     processor = VibePodProcessor.from_pretrained(
@@ -228,12 +167,12 @@ def main():
     
     # Override speech_tok_compress_ratio if provided
     if args.speech_tok_compress_ratio != processor.speech_tok_compress_ratio:
-        logger.info(f"Overriding speech_tok_compress_ratio from {processor.speech_tok_compress_ratio} to {args.speech_tok_compress_ratio}")
+        print(f"Overriding speech_tok_compress_ratio from {processor.speech_tok_compress_ratio} to {args.speech_tok_compress_ratio}")
         processor.speech_tok_compress_ratio = args.speech_tok_compress_ratio
     
     # Override db_normalize if different
     if args.db_normalize != processor.db_normalize:
-        logger.info(f"Overriding db_normalize from {processor.db_normalize} to {args.db_normalize}")
+        print(f"Overriding db_normalize from {processor.db_normalize} to {args.db_normalize}")
         processor.db_normalize = args.db_normalize
         processor.audio_normalizer = AudioNormalizer() if args.db_normalize else None
     
@@ -245,19 +184,8 @@ def main():
     )
     model.eval()
     
-    # Process input file
-    if args.input_sample.endswith('.json'):
-        script, speaker_ids = convert_json_to_script(args.input_sample)
-        base_name = Path(args.input_sample).stem
-    elif args.input_sample.endswith('.txt'):
-        script, speaker_ids = convert_text_to_script(args.input_sample)
-        base_name = Path(args.input_sample).stem
-    else:
-        raise ValueError("Input file must be .json or .txt format")
-    
-    logger.info(f"Processing script with {len(speaker_ids)} speakers")
-    logger.info(f"Script preview:\n{script[:500]}...")
-    
+    model.set_ddpm_inference_steps(num_steps=10)
+
     # Default voice samples if not provided
     default_voice_samples = [
         "/mnt/conversationhub/zhiliang/other/man_voice.wav",
@@ -266,64 +194,47 @@ def main():
     
     voice_samples = args.voice_samples if args.voice_samples else default_voice_samples
     
-    # Check if we have enough voice samples
-    if len(voice_samples) < len(speaker_ids):
-        logger.warning(f"Not enough voice samples. Need {len(speaker_ids)}, got {len(voice_samples)}")
-        # Repeat the last sample if needed
-        while len(voice_samples) < len(speaker_ids):
-            voice_samples.append(voice_samples[-1])
-    
-    # Only use needed voice samples
-    voice_samples = voice_samples[:len(speaker_ids)]
-    
     # Create output directory
     os.makedirs(args.output_dir, exist_ok=True)
-    
-    # breakpoint()
+    base_name = Path(args.input_sample).stem
 
     # Generate for each cfg_scale
     for cfg_scale in args.cfg_scale:
-        logger.info(f"\nGenerating with cfg_scale={cfg_scale}")
+        print(f"\nGenerating with cfg_scale={cfg_scale}", flush=True)
         
-        # Process the script with processor
-        inputs = processor.process_podcast_script(
-            script=script,
-            speaker_samples=voice_samples,
-            return_tensors="pt"
+        # Process inputs with the simplified interface
+        # The processor now handles everything: file loading, parsing, tokenization, and preparation
+        inputs = processor(
+            text=args.input_sample,  # Can be file path or script content
+            voice_samples=voice_samples,
+            return_tensors="pt",
+            device=device,
+            dtype=dtype,
+            prepare_for_generation=True,  # This splits input_ids into prompt_ids and last_ids
         )
         
-        # Move inputs to device
-        input_ids = torch.tensor(inputs["input_ids"], device=device)
-        speech_input_mask = torch.tensor(inputs["speech_input_mask"], device=device, dtype=torch.bool)
-        
-        # Prepare speech inputs if available
-        if inputs["speech_inputs"]:
-            speech_dict = processor.prepare_speech_inputs(
-                inputs["speech_inputs"],
-                return_tensors="pt",
-                device=device,
-                dtype=dtype
-            )
-            speech_tensors = speech_dict["padded_speeches"]
-            speech_masks = speech_dict["speech_masks"]
-        else:
-            speech_tensors = None
-            speech_masks = None
-        
-        # Split input_ids for generation
-        prompt_ids = input_ids[:-1]
-        last_ids = input_ids[-1].unsqueeze(0)
+        # Extract prepared inputs
+        prompt_ids = inputs["prompt_ids"]
+        last_ids = inputs["last_ids"]
+        speech_tensors = inputs.get("speech_tensors")
+        speech_masks = inputs.get("speech_masks")
+        speech_input_mask = inputs.get("speech_input_mask")
         
         # Determine max tokens if not specified
         if args.max_new_tokens is None:
             # Estimate based on script length
             max_seq_len = model.config.decoder_config.max_position_embeddings
-            args.max_new_tokens = max_seq_len - len(input_ids)
-            logger.info(f"Auto-set max_new_tokens to {args.max_new_tokens}")
-        
+            args.max_new_tokens = max_seq_len - len(prompt_ids) - 1
+            print(f"Auto-set max_new_tokens to {args.max_new_tokens}")
+
+        # Log parsed script info
+        if "parsed_script" in inputs:
+            print(f"Processing script with {len(inputs['all_speakers'])} speakers", flush=True)
+            script_preview = "\n".join([f"Speaker {sid}: {text}..." for sid, text in inputs["parsed_script"]])
+            print(f"Script preview:\n{script_preview}", flush=True)
+
         # Generate speech
-        logger.info("Starting generation...")
-        
+        print("Starting generation...")
         with torch.no_grad():
             # Use semantic-acoustic generation if available
             output_tokens, output_speeches = model.generate_multiple_speeches_semantic_acoustic(
@@ -332,49 +243,26 @@ def main():
                 tokenizer=processor.tokenizer,
                 speech_tensors=speech_tensors,
                 speech_masks=speech_masks,
-                speech_input_mask=speech_input_mask[:-1],  # Exclude last token
+                speech_input_mask=speech_input_mask,
                 cfg_scale=cfg_scale,
                 temperature=args.temperature,
                 max_new_tokens=args.max_new_tokens,
                 verbose=True,
             )
-            
         
-        logger.info(f"Generated {len(output_speeches)} speech segments")
+        print(f"Generated {len(output_speeches)} speech segments")
         
         # Save generated audio
         if output_speeches:
-            # Concatenate all audio segments
-            full_audio_list = []
-            for audio in output_speeches:
-                if isinstance(audio, torch.Tensor):
-                    full_audio_list.append(audio.detach().float().cpu().numpy())
-                else:
-                    full_audio_list.append(audio)
-            
-            # Concatenate along time dimension
-            full_audio = np.concatenate(full_audio_list, axis=-1)
-            full_audio = np.clip(full_audio, -1, 1)
-            
-            # Save audio file
-            os.makedirs(args.output_dir, exist_ok=True)
-            output_filename = f"{base_name}_cfg{cfg_scale}.wav"
-            output_path = os.path.join(args.output_dir, output_filename)
-            
-            sf.write(output_path, full_audio.squeeze(), 24000)
-            logger.info(f"Saved audio to {output_path}")
-            
-            # # Also save the generated text tokens
-            # generated_text = processor.tokenizer.decode(output_tokens[0], skip_special_tokens=True)
-            # text_output_path = output_path.replace('.wav', '.txt')
-            # with open(text_output_path, 'w') as f:
-            #     f.write(f"Script:\n{script}\n\n")
-            #     f.write(f"Generated tokens:\n{generated_text}\n")
-            # logger.info(f"Saved generated text to {text_output_path}")
+            processor.save_audio(
+                torch.cat(output_speeches, dim=-1),
+                output_path=os.path.join(args.output_dir, f"{base_name}_cfg{cfg_scale}_new.wav"),
+            )
+        
         else:
             logger.warning("No audio segments were generated")
     
-    logger.info("\nGeneration complete!")
+    print("\nGeneration complete!")
 
 
 if __name__ == "__main__":
@@ -383,8 +271,8 @@ if __name__ == "__main__":
 # Example usage:
 # python test_vibepod.py \
 #     --model_path /tmp/vibepod-model \
-#     --input_sample speech_tokenizer.txt \
+#     --input_sample /home/pengzhiliang/speech_qwen/evals/speech/podcast/speech_tokenizer.txt \
 #     --output_dir ./tts_results \
-#     --cfg_scale 2.0 3.0 \
+#     --cfg_scale 1.2 1.3 \
 #     --temperature 0.8 \
 #     --db_normalize

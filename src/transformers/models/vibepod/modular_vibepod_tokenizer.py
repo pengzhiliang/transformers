@@ -189,6 +189,43 @@ class NormConvTranspose1d(nn.Module):
         return x
 
 
+class VibePodTokenizerStreamingCache:
+    """Cache for streaming convolution, similar to KV cache in attention"""
+    def __init__(self):
+        self.cache = {}  # Dict mapping (layer_id, sample_idx) to state tensor
+        
+    def get(self, layer_id: str, sample_indices: torch.Tensor) -> Optional[torch.Tensor]:
+        """Get cached states for given layer and sample indices"""
+        states = []
+        for idx in sample_indices.tolist():
+            key = (layer_id, idx)
+            if key not in self.cache:
+                return None  # If any sample is missing, return None
+            states.append(self.cache[key])
+        return torch.stack(states, dim=0)
+    
+    def set(self, layer_id: str, sample_indices: torch.Tensor, states: torch.Tensor):
+        """Set cached states for given layer and sample indices"""
+        for i, idx in enumerate(sample_indices.tolist()):
+            key = (layer_id, idx)
+            self.cache[key] = states[i].detach()
+    
+    def clear(self, layer_id: Optional[str] = None, sample_indices: Optional[torch.Tensor] = None):
+        """Clear cache for specific layer/samples or everything"""
+        if layer_id is None and sample_indices is None:
+            self.cache.clear()
+        elif layer_id is not None and sample_indices is None:
+            # Clear all samples for a specific layer
+            keys_to_remove = [k for k in self.cache.keys() if k[0] == layer_id]
+            for k in keys_to_remove:
+                del self.cache[k]
+        elif layer_id is not None and sample_indices is not None:
+            # Clear specific samples for a specific layer
+            for idx in sample_indices.tolist():
+                key = (layer_id, idx)
+                self.cache.pop(key, None)
+
+
 class SConv1d(nn.Module):
     """Conv1d with built-in handling of asymmetric or causal padding and normalization."""
     def __init__(self, in_channels: int, out_channels: int,
@@ -202,93 +239,144 @@ class SConv1d(nn.Module):
                             norm=norm, norm_kwargs=norm_kwargs)
         self.causal = causal
         self.pad_mode = pad_mode
-
-        # use for streaming
-        self.streaming = False 
-        self.init_streaming_state = False
+        
+        # Store configuration
         self.kernel_size = kernel_size
         self.dilation = dilation
         self.stride = stride
-        # Compute effective kernel size considering dilation
-        self.effective_kernel_size = (kernel_size - 1) * dilation + 1
-        # Compute total padding required for causal convolution
+        self.in_channels = in_channels
+        self.out_channels = out_channels
+        
+        # For causal convolution, we need to maintain kernel_size - 1 samples as context
+        self.context_size = (kernel_size - 1) * dilation
+        
+        # For non-streaming mode, calculate padding
         self.padding_total = (kernel_size - 1) * dilation - (stride - 1)
-        self.state = None
-    
-    def set_streaming(self, streaming: bool, init_streaming_state: bool = False):
-        """Set streaming mode and initialize state if required"""
-        self.streaming = streaming
-        self.init_streaming_state = init_streaming_state
-
-    def reset_state(self):
-        """Reset streaming state"""
-        self.state = None
-    
-    def init_state(self, batch_size, device, dtype=torch.float32):
-        """Initialize state buffer for streaming convolution"""
-        if self.causal:
-            # For causal convolution, we need to keep padding_total samples
-            return torch.zeros(
-                batch_size,
-                self.conv.conv.in_channels,
-                self.padding_total,
-                device=device,
-                dtype=dtype
-            )
-        else:
-            return None  # Non-causal streaming not fully supported yet
         
-    def forward(self, x):
-        if not self.streaming:
-            B, C, T = x.shape
-            kernel_size = self.conv.conv.kernel_size[0]
-            stride = self.conv.conv.stride[0]
-            dilation = self.conv.conv.dilation[0]
-            padding_total = (kernel_size - 1) * dilation - (stride - 1)
-            extra_padding = get_extra_padding_for_conv1d(x, kernel_size, stride, padding_total)
-            if self.causal:
-                # Left padding for causal
-                if self.pad_mode == 'constant':
-                    x = pad1d(x, (padding_total, extra_padding), mode=self.pad_mode, value=0)
-                else:
-                    x = pad1d(x, (padding_total, extra_padding), mode=self.pad_mode)
+        # Create a unique layer ID for cache management
+        self._layer_id = None
+        
+    @property
+    def layer_id(self):
+        if self._layer_id is None:
+            self._layer_id = f"sconv1d_{id(self)}"
+        return self._layer_id
+        
+    def forward(self, x: torch.Tensor, 
+                cache: Optional[VibePodTokenizerStreamingCache] = None,
+                sample_indices: Optional[torch.Tensor] = None,
+                use_cache: bool = False,
+                debug: bool = False) -> torch.Tensor:
+        """
+        Forward pass with optional streaming support via cache.
+        
+        Args:
+            x: Input tensor [batch_size, channels, time]
+            cache: VibePodTokenizerStreamingCache object for maintaining states
+            sample_indices: Indices identifying each sample for cache management
+            use_cache: Whether to use cached states for streaming
+            debug: Whether to print debug information
+            
+        Returns:
+            Output tensor
+        """
+        B, C, T = x.shape
+        
+        # Non-streaming mode
+        if not use_cache or cache is None:
+            return self._forward_non_streaming(x, debug=debug)
+        
+        # Streaming mode
+        assert self.causal, "Streaming mode is only supported for causal convolutions"
+        assert sample_indices is not None, "sample_indices must be provided for streaming mode"
+        assert len(sample_indices) == B, "sample_indices must match batch size"
+        
+        # Get cached states
+        cached_states = cache.get(self.layer_id, sample_indices)
+        
+        if cached_states is None:
+            # First chunk - initialize with zeros for context
+            if self.context_size > 0:
+                cached_states = torch.zeros(B, C, self.context_size, device=x.device, dtype=x.dtype)
+                if debug:
+                    print(f"[DEBUG] Initialized cache with shape: {cached_states.shape}, context_size={self.context_size}")
             else:
-                # Asymmetric padding required for odd strides
-                padding_right = padding_total // 2
-                padding_left = padding_total - padding_right
-                x = pad1d(x, (padding_left, padding_right + extra_padding), mode=self.pad_mode)
-            return self.conv(x)
-        else:
-            assert self.causal, "Streaming mode is only supported for causal convolutions"
-
-            batch_size = x.size(0)
-            if self.init_streaming_state:
-                self.state = self.init_state(batch_size, x.device, x.dtype)
-
-            # Get key parameters
-            kernel_size = self.kernel_size
-            stride = self.stride
-            dilation = self.dilation
-            padding_total = self.padding_total
-            extra_padding = get_extra_padding_for_conv1d(x, kernel_size, stride, padding_total)
-
-            input_with_state = torch.cat([self.state, x], dim=2)
+                cached_states = torch.zeros(B, C, 0, device=x.device, dtype=x.dtype)
+                if debug:
+                    print(f"[DEBUG] No context needed (kernel_size=stride)")
         
-            # Apply padding (only on the right for streaming mode)
-            padded_input = F.pad(input_with_state, (0, extra_padding), mode='constant')
+        # Concatenate cached states with input
+        if cached_states.shape[2] > 0:
+            input_with_context = torch.cat([cached_states, x], dim=2)
+        else:
+            input_with_context = x
             
-            # Apply the convolution
-            output = self.conv(padded_input)
+        if debug:
+            print(f"[DEBUG] Input shape: {x.shape}, Cache shape: {cached_states.shape}, Combined: {input_with_context.shape}")
+        
+        # Apply convolution directly - no extra padding in streaming mode
+        # The conv layer will handle its own padding internally
+        output = self.conv(input_with_context)
+        
+        if debug:
+            print(f"[DEBUG] Output shape: {output.shape}")
+        
+        # Update cache for next chunk
+        # We need to keep the last context_size samples for the next iteration
+        if self.context_size > 0:
+            # Calculate how many samples to keep
+            total_input_length = input_with_context.shape[2]
             
-            # Update state for next chunk - we need padding_total samples
-            # We take samples from the input, not the padded version
-            new_state_start = max(0, input_with_state.size(2) - padding_total)
-            self.state = input_with_state[:, :, new_state_start:].detach()
+            # Keep the last context_size samples
+            if total_input_length >= self.context_size:
+                new_cache_start = total_input_length - self.context_size
+                new_cache = input_with_context[:, :, new_cache_start:]
+            else:
+                # If we have less than context_size samples, keep everything
+                new_cache = input_with_context
+                
+            if debug:
+                print(f"[DEBUG] New cache shape: {new_cache.shape}")
+                
+            cache.set(self.layer_id, sample_indices, new_cache)
+        
+        return output
+    
+    def _forward_non_streaming(self, x: torch.Tensor, debug: bool = False) -> torch.Tensor:
+        """Standard forward pass without streaming"""
+        B, C, T = x.shape
+        kernel_size = self.kernel_size
+        stride = self.stride
+        dilation = self.dilation
+        padding_total = self.padding_total
+        
+        # Compute extra padding for stride alignment
+        extra_padding = get_extra_padding_for_conv1d(x, kernel_size, stride, padding_total)
+        
+        if debug:
+            print(f"[DEBUG NON-STREAMING] Input shape: {x.shape}, padding_total={padding_total}, extra_padding={extra_padding}")
+        
+        if self.causal:
+            # Left padding for causal
+            if self.pad_mode == 'constant':
+                x = pad1d(x, (padding_total, extra_padding), mode=self.pad_mode, value=0)
+            else:
+                x = pad1d(x, (padding_total, extra_padding), mode=self.pad_mode)
+        else:
+            # Symmetric padding for non-causal
+            padding_right = padding_total // 2
+            padding_left = padding_total - padding_right
+            x = pad1d(x, (padding_left, padding_right + extra_padding), mode=self.pad_mode)
+        
+        if debug:
+            print(f"[DEBUG NON-STREAMING] After padding: {x.shape}")
             
-            # For causal convolutions, all the valid outputs correspond to the new input,
-            # since we've provided the needed left context via the state
-            return output
-
+        output = self.conv(x)
+        
+        if debug:
+            print(f"[DEBUG NON-STREAMING] Output shape: {output.shape}")
+        
+        return output
 
 class SConvTranspose1d(nn.Module):
     """ConvTranspose1d with built-in handling of asymmetric or causal padding and normalization."""
@@ -305,99 +393,154 @@ class SConvTranspose1d(nn.Module):
             "`trim_right_ratio` != 1.0 only makes sense for causal convolutions"
         assert self.trim_right_ratio >= 0. and self.trim_right_ratio <= 1.
 
-        # use for streaming
-        self.streaming = False 
-        self.init_streaming_state = False
+        # Store configuration
         self.kernel_size = kernel_size
         self.stride = stride
+        self.in_channels = in_channels
+        self.out_channels = out_channels
+        
+        # For transposed convolution, padding calculation is different
         self.padding_total = kernel_size - stride
-        self.position = 0
-        self.input_buffer = None
+        
+        # For streaming, we need to keep track of input history
+        # Transposed conv needs to see multiple input samples to produce correct output
+        self.context_size = kernel_size - 1
+        
+        # Create a unique layer ID for cache management
+        self._layer_id = None
     
-    def set_streaming(self, streaming: bool, init_streaming_state: bool = False):
-        """Set streaming mode and initialize state if required"""
-        self.streaming = streaming
-        self.init_streaming_state = init_streaming_state
-
-    def reset_state(self):
-        """Reset streaming state buffers"""
-        self.input_buffer = None
-        self.position = 0
+    @property
+    def layer_id(self):
+        if self._layer_id is None:
+            self._layer_id = f"sconvtr1d_{id(self)}"
+        return self._layer_id
     
-    def process_nonstreaming(self, x):
-        """Process in non-streaming mode"""
-        kernel_size = self.convtr.convtr.kernel_size[0]
-        stride = self.convtr.convtr.stride[0]
-        padding_total = kernel_size - stride
-
+    def forward(self, x: torch.Tensor,
+                cache: Optional[VibePodTokenizerStreamingCache] = None,
+                sample_indices: Optional[torch.Tensor] = None,
+                use_cache: bool = False,
+                debug: bool = False) -> torch.Tensor:
+        """
+        Forward pass with optional streaming support via cache.
+        
+        Args:
+            x: Input tensor [batch_size, channels, time]
+            cache: VibePodTokenizerStreamingCache object for maintaining states
+            sample_indices: Indices identifying each sample for cache management
+            use_cache: Whether to use cached states for streaming
+            debug: Whether to print debug information
+            
+        Returns:
+            Output tensor
+        """
+        B, C, T = x.shape
+        
+        # Non-streaming mode
+        if not use_cache or cache is None:
+            return self._forward_non_streaming(x, debug=debug)
+        
+        # Streaming mode
+        assert sample_indices is not None, "sample_indices must be provided for streaming mode"
+        assert len(sample_indices) == B, "sample_indices must match batch size"
+        
+        # Get cached states (input history for transposed conv)
+        cached_input = cache.get(self.layer_id, sample_indices)
+        
+        if cached_input is None:
+            # First chunk - no history yet
+            cached_input = torch.zeros(B, C, 0, device=x.device, dtype=x.dtype)
+            if debug:
+                print(f"[DEBUG] Initialized empty cache for transposed conv")
+        
+        # Concatenate cached input with new input
+        full_input = torch.cat([cached_input, x], dim=2)
+        
+        if debug:
+            print(f"[DEBUG] Input shape: {x.shape}, Cache shape: {cached_input.shape}, Combined: {full_input.shape}")
+        
+        # For transposed convolution in streaming mode, we need to handle output generation carefully
+        # The key insight: each input sample can affect multiple output samples
+        
+        # Apply transposed convolution to the full input
+        full_output = self.convtr(full_input)
+        
+        if debug:
+            print(f"[DEBUG] Full transposed conv output shape: {full_output.shape}")
+        
+        # Calculate padding to remove
+        if self.causal:
+            padding_right = math.ceil(self.padding_total * self.trim_right_ratio)
+            padding_left = self.padding_total - padding_right
+        else:
+            padding_right = self.padding_total // 2
+            padding_left = self.padding_total - padding_right
+        
+        # Remove padding
+        if padding_left + padding_right > 0:
+            full_output = unpad1d(full_output, (padding_left, padding_right))
+        
+        if debug:
+            print(f"[DEBUG] After unpadding: {full_output.shape}")
+        
+        # Determine which part of the output corresponds to the new input
+        # For streaming, we only want the output that corresponds to the new input samples
+        if cached_input.shape[2] == 0:
+            # First chunk - return all output
+            output = full_output
+        else:
+            # Subsequent chunks - return only the new output
+            # The number of new output samples should be approximately T * stride
+            expected_new_output = T * self.stride
+            
+            # Take the last expected_new_output samples
+            if full_output.shape[2] >= expected_new_output:
+                output = full_output[:, :, -expected_new_output:]
+            else:
+                output = full_output
+        
+        if debug:
+            print(f"[DEBUG] Final streaming output shape: {output.shape}")
+        
+        # Update cache: keep recent input samples for next iteration
+        # We need to keep enough context for the transposed convolution
+        if full_input.shape[2] > self.context_size:
+            new_cache = full_input[:, :, -self.context_size:]
+        else:
+            new_cache = full_input
+        
+        if debug:
+            print(f"[DEBUG] New cache shape: {new_cache.shape}")
+            
+        cache.set(self.layer_id, sample_indices, new_cache)
+        
+        return output
+    
+    def _forward_non_streaming(self, x: torch.Tensor, debug: bool = False) -> torch.Tensor:
+        """Standard forward pass without streaming"""
+        if debug:
+            print(f"[DEBUG NON-STREAMING] Input shape: {x.shape}")
+        
+        # Apply transposed convolution
         y = self.convtr(x)
-
+        
+        if debug:
+            print(f"[DEBUG NON-STREAMING] After transposed conv: {y.shape}")
+        
+        # Calculate and remove padding
         if self.causal:
-            padding_right = math.ceil(padding_total * self.trim_right_ratio)
-            padding_left = padding_total - padding_right
-            y = unpad1d(y, (padding_left, padding_right))
+            padding_right = math.ceil(self.padding_total * self.trim_right_ratio)
+            padding_left = self.padding_total - padding_right
         else:
-            padding_right = padding_total // 2
-            padding_left = padding_total - padding_right
+            padding_right = self.padding_total // 2
+            padding_left = self.padding_total - padding_right
+        
+        if padding_left + padding_right > 0:
             y = unpad1d(y, (padding_left, padding_right))
+        
+        if debug:
+            print(f"[DEBUG NON-STREAMING] Final output shape: {y.shape}")
+            
         return y
-    
-    def get_padding(self):
-        """Calculate padding values based on configuration"""
-        kernel_size = self.convtr.convtr.kernel_size[0]
-        stride = self.convtr.convtr.stride[0]
-        padding_total = kernel_size - stride
-        
-        if self.causal:
-            padding_right = math.ceil(padding_total * self.trim_right_ratio)
-            padding_left = padding_total - padding_right
-        else:
-            padding_right = padding_total // 2
-            padding_left = padding_total - padding_right
-            
-        return padding_left, padding_right
-    
-    def forward(self, x):
-        if not self.streaming:
-            return self.process_nonstreaming(x)
-        
-        batch_size = x.size(0)
-        if self.init_streaming_state:
-            self.reset_state()
-        
-        if self.input_buffer is None:
-            self.input_buffer = x
-        else:
-            # Concatenate new input with saved buffer
-            self.input_buffer = torch.cat([self.input_buffer, x], dim=2)
-            
-        # Calculate how much output we should produce
-        output_length = x.size(2) * self.stride
-        
-        # Check if we have enough input data to produce the expected output
-        # For transposed conv, we need to ensure we have enough context to the left
-        min_input_needed = math.ceil(output_length / self.stride)
-        
-        if self.input_buffer.size(2) >= min_input_needed:
-            # Process the entire buffer
-            with torch.no_grad():
-                # Apply the transposed convolution to the entire buffer
-                full_output = self.process_nonstreaming(self.input_buffer)
-            
-            # Determine which part of the output corresponds to the current input chunk
-            start_pos = max(0, full_output.size(2) - output_length)
-            
-            # Extract the relevant part of the output
-            output = full_output[:, :, start_pos:]
-            
-            # Keep only the minimum required context for the next chunk
-            keep_size = min(self.kernel_size - 1, self.input_buffer.size(2))
-            self.input_buffer = self.input_buffer[:, :, -keep_size:] if keep_size > 0 else None
-            
-            return output
-        else:
-            # Not enough data yet, return empty tensor matching expected shape
-            return torch.zeros(batch_size, self.convtr.convtr.out_channels, 0, device=x.device)
 
 
 # FFN and Convolution layers
@@ -597,30 +740,44 @@ class TokenizerEncoder(nn.Module):
         else:
             self.norm = nn.Identity()
         self.head = SConv1d(in_ch, self.dimension, kernel_size=last_kernel_size, causal=self.causal, pad_mode=pad_mode, norm=norm, bias=bias)
-        
-        self.streaming = False
-        self.init_streaming_state = False
 
-    def forward_features(self, x, streaming=False, init_streaming_state=False):
-        # Set global attributes
-        if streaming != self.streaming or init_streaming_state != self.init_streaming_state:
-            # update the streaming and init_streaming_state attributes
-            self.streaming = streaming
-            self.init_streaming_state = init_streaming_state
-            for layer in self.modules():
-                if isinstance(layer, (SConv1d, SConvTranspose1d)):
-                    if hasattr(layer, 'set_streaming'):
-                        layer.set_streaming(streaming, init_streaming_state)
-
+    def forward_features(self, x, cache=None, sample_indices=None, use_cache=False, debug=False):
         for i in range(len(self.depths)):
-            x = self.downsample_layers[i](x)
-            x = self.stages[i](x)
+            # Apply downsampling
+            for layer in self.downsample_layers[i]:
+                if isinstance(layer, SConv1d):
+                    x = layer(x, cache=cache, sample_indices=sample_indices, use_cache=use_cache, debug=debug)
+                else:
+                    x = layer(x)
+            
+            # Apply stage (Block1D contains Convlayer which contains SConv1d)
+            for block in self.stages[i]:
+                if hasattr(block, 'mixer') and hasattr(block.mixer, 'conv') and isinstance(block.mixer.conv, SConv1d):
+                    # Block1D forward with cache support
+                    residual = x
+                    x = block.norm(x)
+                    x = block.mixer.conv(x, cache=cache, sample_indices=sample_indices, use_cache=use_cache, debug=debug)
+                    if block.gamma is not None:
+                        x = x * block.gamma.unsqueeze(-1)
+                    x = residual + block.drop_path(x)
+                    
+                    # FFN part
+                    residual = x
+                    x = block.ffn_norm(x)
+                    x = x.permute(0, 2, 1)
+                    x = block.ffn(x)
+                    x = x.permute(0, 2, 1)
+                    if block.ffn_gamma is not None:
+                        x = x * block.ffn_gamma.unsqueeze(-1)
+                    x = residual + block.drop_path(x)
+                else:
+                    x = block(x)
 
         return self.norm(x)
 
-    def forward(self, x, streaming=False, init_streaming_state=False):
-        x = self.forward_features(x, streaming=streaming, init_streaming_state=init_streaming_state)
-        x = self.head(x)
+    def forward(self, x, cache=None, sample_indices=None, use_cache=False, debug=False):
+        x = self.forward_features(x, cache=cache, sample_indices=sample_indices, use_cache=use_cache, debug=debug)
+        x = self.head(x, cache=cache, sample_indices=sample_indices, use_cache=use_cache, debug=debug)
         return x
 
 
@@ -721,34 +878,47 @@ class TokenizerDecoder(nn.Module):
         else:
             self.norm = nn.Identity()
         self.head = SConv1d(in_ch, self.channels, kernel_size=last_kernel_size, causal=self.causal, pad_mode=pad_mode, norm=norm, bias=bias)
-        
-        self.streaming = False
-        self.init_streaming_state = False
 
-    def forward_features(self, x, streaming=False, init_streaming_state=False):
-        # pdb.set_trace()
-        # Set global attributes
-        if streaming != self.streaming or init_streaming_state != self.init_streaming_state:
-            # update the streaming and init_streaming_state attributes
-            self.streaming = streaming
-            self.init_streaming_state = init_streaming_state
-            for layer in self.modules():
-                if isinstance(layer, (SConv1d, SConvTranspose1d)):
-                    if hasattr(layer, 'set_streaming'):
-                        # print(f"Set streaming for {layer.__class__.__name__}: {layer}")
-                        layer.set_streaming(streaming, init_streaming_state)
-
+    def forward_features(self, x, cache=None, sample_indices=None, use_cache=False, debug=False):
         for i in range(len(self.depths)):
-            x = self.upsample_layers[i](x)
-            x = self.stages[i](x)
+            # Apply upsampling
+            for layer in self.upsample_layers[i]:
+                if isinstance(layer, (SConv1d, SConvTranspose1d)):
+                    x = layer(x, cache=cache, sample_indices=sample_indices, use_cache=use_cache, debug=debug)
+                else:
+                    x = layer(x)
+            
+            # Apply stage (Block1D contains Convlayer which contains SConv1d)
+            for block in self.stages[i]:
+                if hasattr(block, 'mixer') and hasattr(block.mixer, 'conv') and isinstance(block.mixer.conv, SConv1d):
+                    # Block1D forward with cache support
+                    residual = x
+                    x = block.norm(x)
+                    x = block.mixer.conv(x, cache=cache, sample_indices=sample_indices, use_cache=use_cache, debug=debug)
+                    if block.gamma is not None:
+                        x = x * block.gamma.unsqueeze(-1)
+                    x = residual + block.drop_path(x)
+                    
+                    # FFN part
+                    residual = x
+                    x = block.ffn_norm(x)
+                    x = x.permute(0, 2, 1)
+                    x = block.ffn(x)
+                    x = x.permute(0, 2, 1)
+                    if block.ffn_gamma is not None:
+                        x = x * block.ffn_gamma.unsqueeze(-1)
+                    x = residual + block.drop_path(x)
+                else:
+                    x = block(x)
 
         return self.norm(x)
     
-    def forward(self, x, streaming=False, init_streaming_state=False):
-        x = self.forward_features(x, streaming=streaming, init_streaming_state=init_streaming_state)
-        x = self.head(x)
+    def forward(self, x, cache=None, sample_indices=None, use_cache=False, debug=False):
+        x = self.forward_features(x, cache=cache, sample_indices=sample_indices, use_cache=use_cache, debug=debug)
+        x = self.head(x, cache=cache, sample_indices=sample_indices, use_cache=use_cache, debug=debug)
         return x
     
+
 @dataclass
 class VibePodTokenizerEncoderOutput:
     """
@@ -875,9 +1045,9 @@ class VibePodAcousticTokenizerModel(PreTrainedModel):
                 nn.init.zeros_(module.bias)
     
     @torch.no_grad()
-    def encode(self, audio, streaming=False, init_streaming_state=False):
+    def encode(self, audio, cache=None, sample_indices=None, use_cache=False, debug=False):
         """Convert audio to latent representations"""
-        latents = self.encoder(audio, streaming=streaming, init_streaming_state=init_streaming_state)
+        latents = self.encoder(audio, cache=cache, sample_indices=sample_indices, use_cache=use_cache, debug=debug)
         return VibePodTokenizerEncoderOutput(mean=latents.permute(0, 2, 1), std=self.fix_std)
     
     @torch.no_grad()
@@ -893,23 +1063,21 @@ class VibePodAcousticTokenizerModel(PreTrainedModel):
             raise ValueError(f"Unsupported dist_type: {dist_type}, expected 'fix' or 'gaussian'")
     
     @torch.no_grad()
-    def decode(self, latents, streaming=False, init_streaming_state=False):
+    def decode(self, latents, cache=None, sample_indices=None, use_cache=False, debug=False):
         """Convert latent representations back to audio"""
-        # audio = self.decoder(latents, streaming=streaming, init_streaming_state=init_streaming_state)
-        # return audio
         if latents.shape[1] == self.config.vae_dim:
             pass
         else:
             latents = latents.permute(0, 2, 1)
 
-        audio = self.decoder(latents, streaming=streaming, init_streaming_state=init_streaming_state)
+        audio = self.decoder(latents, cache=cache, sample_indices=sample_indices, use_cache=use_cache, debug=debug)
         return audio
 
-    def forward(self, audio, streaming=False, init_streaming_state=False):
+    def forward(self, audio, cache=None, sample_indices=None, use_cache=False, debug=False):
         """Full forward pass: encode audio to latents, then decode back to audio"""
-        encoder_output = self.encode(audio, streaming=streaming, init_streaming_state=init_streaming_state)
+        encoder_output = self.encode(audio, cache=cache, sample_indices=sample_indices, use_cache=use_cache, debug=debug)
         sampled_latents, _ = self.sampling(encoder_output)
-        reconstructed = self.decode(sampled_latents, streaming=streaming, init_streaming_state=init_streaming_state)
+        reconstructed = self.decode(sampled_latents, cache=cache, sample_indices=sample_indices, use_cache=use_cache, debug=debug)
         return reconstructed, sampled_latents
 
 
@@ -964,9 +1132,9 @@ class VibePodSemanticTokenizerModel(PreTrainedModel):
                 nn.init.zeros_(module.bias)
     
     @torch.no_grad()
-    def encode(self, audio, streaming=False, init_streaming_state=False):
+    def encode(self, audio, cache=None, sample_indices=None, use_cache=False, debug=False):
         """Convert audio to latent representations"""
-        latents = self.encoder(audio, streaming=streaming, init_streaming_state=init_streaming_state)
+        latents = self.encoder(audio, cache=cache, sample_indices=sample_indices, use_cache=use_cache, debug=debug)
         return VibePodTokenizerEncoderOutput(mean=latents.permute(0, 2, 1))
     
     @torch.no_grad()
@@ -974,13 +1142,14 @@ class VibePodSemanticTokenizerModel(PreTrainedModel):
         """Sample from the encoder output distribution"""
         return encoder_output.sample(dist_type='none')
 
-    def forward(self, audio, streaming=False, init_streaming_state=False):
+    def forward(self, audio, cache=None, sample_indices=None, use_cache=False, debug=False):
         """Full forward pass: encode audio to latents, then decode back to audio"""
-        encoder_output = self.encode(audio, streaming=streaming, init_streaming_state=init_streaming_state)
+        encoder_output = self.encode(audio, cache=cache, sample_indices=sample_indices, use_cache=use_cache, debug=debug)
         sampled_latents, _ = self.sampling(encoder_output, dist_type='none')
         return None, sampled_latents
 
 __all__ = [
+    "VibePodTokenizerStreamingCache",
     "VibePodAcousticTokenizerModel",
     "VibePodSemanticTokenizerModel",
 ]

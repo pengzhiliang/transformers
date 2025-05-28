@@ -2,6 +2,7 @@ import math
 import warnings
 from typing import List, Optional, Union, Dict, Any, Tuple
 import os
+import re
 
 import numpy as np
 import torch
@@ -38,6 +39,7 @@ class VibePodProcessor:
         self.speech_tok_compress_ratio = speech_tok_compress_ratio
         self.db_normalize = db_normalize
         self.audio_normalizer = AudioNormalizer() if db_normalize else None
+        self.system_prompt = " Transform the text provided by various speakers into speech output, utilizing the distinct voice of each respective speaker.\n"
 
     @classmethod
     def from_pretrained(cls, pretrained_model_name_or_path, **kwargs):
@@ -171,12 +173,11 @@ class VibePodProcessor:
         all_speakers = list(set(speaker_id for speaker_id, _ in parsed_lines))
         
         # Create system prompt
-        system_prompt = " Transform the text provided by various speakers into speech output, utilizing the distinct voice of each respective speaker.\n"
-        system_tokens = self.tokenizer.encode(system_prompt, add_special_tokens=False)
+        system_tokens = self.tokenizer.encode(self.system_prompt, add_special_tokens=False)
         
         # Process voice samples if provided
         if speaker_samples:
-            voice_tokens, voice_speech_inputs, voice_speech_masks = self._create_voice_prompt(speaker_samples)
+            voice_tokens, voice_speech_inputs, voice_speech_masks = self._create_voice_prompt(speaker_samples[:len(all_speakers)])
         else:
             voice_tokens, voice_speech_inputs, voice_speech_masks = [], [], []
         
@@ -224,25 +225,6 @@ class VibePodProcessor:
                 encoding = encoding.convert_to_tensors(return_tensors, prepend_batch_axis=False)
             
         return encoding
-
-    def _parse_script(self, script: str) -> List[Tuple[int, str]]:
-        """Parse script into list of (speaker_id, text) tuples."""
-        lines = script.strip().split("\n")
-        parsed_lines = []
-        
-        for line in lines:
-            if not line.strip():
-                continue
-            try:
-                speaker_part, text = line.split(":", 1)
-                speaker_id = int(speaker_part.strip().split(" ")[1])
-                text = ' ' + text.strip()
-                # Normalize speaker IDs to start from 0
-                parsed_lines.append((speaker_id - 1 if speaker_id > 0 else 0, text))
-            except Exception as e:
-                logger.warning(f"Error parsing line: '{line}' - {str(e)}")
-                
-        return parsed_lines
 
     def _create_voice_prompt(
         self, 
@@ -348,81 +330,194 @@ class VibePodProcessor:
 
     def __call__(
         self,
-        text: Optional[Union[TextInput, PreTokenizedInput, List[TextInput], List[PreTokenizedInput]]] = None,
-        audio: Optional[Union[np.ndarray, List[np.ndarray]]] = None,
-        script: Optional[str] = None,
-        speaker_samples: Optional[List[Union[str, np.ndarray]]] = None,
-        add_special_tokens: bool = True,
-        padding: Union[bool, str, PaddingStrategy] = False,
-        truncation: Union[bool, str, TruncationStrategy] = None,
-        max_length: Optional[int] = None,
+        text: Optional[Union[str, TextInput, PreTokenizedInput, List[TextInput], List[PreTokenizedInput]]] = None,
+        voice_samples: Optional[List[Union[str, np.ndarray]]] = None,
         return_tensors: Optional[Union[str, TensorType]] = None,
-        return_attention_mask: Optional[bool] = None,
+        device: Optional[Union[str, torch.device]] = None,
+        dtype: Optional[torch.dtype] = None,
+        prepare_for_generation: bool = False,
         **kwargs,
     ) -> BatchEncoding:
+        
+        # Determine if text is a file path or direct script
+        script = None
+        if isinstance(text, str):
+            # Check if it's a file path
+            if text.endswith('.json') and os.path.exists(text):
+                script = self._convert_json_to_script(text)
+            elif text.endswith('.txt') and os.path.exists(text):
+                script = self._convert_text_to_script(text)
+            else:
+                # Assume it's the script content directly
+                script = text
+        
+        if script is None:
+            raise ValueError(f"Could not process input text: {text}")
+        
+        # Process podcast script
+        encoding = self.process_podcast_script(
+            script=script,
+            speaker_samples=voice_samples,
+            return_tensors=return_tensors,
+            **kwargs
+        )
+        
+        # Prepare speech inputs if needed
+        if encoding["speech_inputs"] is not None:
+            speech_dict = self.prepare_speech_inputs(
+                encoding["speech_inputs"],
+                return_tensors=return_tensors,
+                device=device,
+                dtype=dtype,
+            )
+            encoding["speech_tensors"] = speech_dict["padded_speeches"]
+            encoding["speech_masks"] = speech_dict["speech_masks"]
+        else:
+            encoding["speech_tensors"] = None
+            encoding["speech_masks"] = None
+        
+        # Move to device if specified
+        if device is not None and return_tensors == "pt":
+            for key in ["input_ids", "speech_input_mask", "speech_tensors", "speech_masks"]:
+                if key in encoding and encoding[key] is not None:
+                    if isinstance(encoding[key], torch.Tensor):
+                        encoding[key] = encoding[key].to(device)
+        
+        # Prepare for generation if requested
+        if prepare_for_generation:
+            if "input_ids" in encoding:
+                encoding["prompt_ids"] = encoding["input_ids"][:-1]
+                encoding["last_ids"] = encoding["input_ids"][-1].unsqueeze(0)
+                # Remove original input_ids to avoid confusion
+                del encoding["input_ids"]
+                
+                # Also adjust speech_input_mask
+                if "speech_input_mask" in encoding:
+                    encoding["speech_input_mask"] = encoding["speech_input_mask"][:-1]
+        
+        return encoding
+        
+    def _convert_json_to_script(self, json_file: str) -> str:
         """
-        Main method to prepare inputs for VibePod models.
+        Convert JSON format to script format.
+        Expected JSON format:
+        [
+            {"speaker": "1", "text": "Hello everyone..."},
+            {"speaker": "2", "text": "Great to be here..."}
+        ]
+        """
+        import json
         
-        This method can handle different input scenarios:
-        1. Text-only input for language modeling
-        2. Audio-only input for speech processing
-        3. Podcast script with speaker samples for TTS generation
-        4. Combined text and audio inputs
+        with open(json_file, 'r', encoding='utf-8') as f:
+            data = json.load(f)
         
-        Args:
-            text: Text input(s) to encode
-            audio: Audio input(s) to process
-            script: Podcast script for TTS generation
-            speaker_samples: Voice samples for each speaker
-            Other arguments are standard tokenizer arguments
+        if not isinstance(data, list):
+            raise ValueError("JSON file must contain a list of speaker entries")
+        
+        script_lines = []
+        for item in data:
+            if not isinstance(item, dict):
+                logger.warning(f"Skipping non-dict entry: {item}")
+                continue
+                
+            speaker = item.get('speaker')
+            text = item.get('text')
             
-        Returns:
-            BatchEncoding with processed inputs
+            if speaker is None or text is None:
+                logger.warning(f"Skipping entry missing speaker or text: {item}")
+                continue
+            
+            # Ensure speaker ID is valid
+            try:
+                speaker_id = int(speaker)
+            except (ValueError, TypeError):
+                logger.warning(f"Invalid speaker ID: {speaker}, skipping entry")
+                continue
+            
+            # Clean up text
+            text = text.strip()
+            if text:
+                script_lines.append(f"Speaker {speaker_id}: {text}")
+        
+        if not script_lines:
+            raise ValueError("No valid entries found in JSON file")
+            
+        return "\n".join(script_lines)
+
+    def _convert_text_to_script(self, text_file: str) -> str:
         """
-        # Handle podcast script processing
-        if script is not None:
-            return self.process_podcast_script(
-                script=script,
-                speaker_samples=speaker_samples,
-                return_tensors=return_tensors,
-                **kwargs
-            )
+        Convert text file to script format.
+        Handles multiple formats:
+        1. Already formatted as "Speaker X: text"
+        2. Plain text (assigns to Speaker 1)
         
-        # Handle text input
-        if text is not None:
-            text_inputs = self.tokenizer(
-                text,
-                add_special_tokens=add_special_tokens,
-                padding=padding,
-                truncation=truncation,
-                max_length=max_length,
-                return_tensors=return_tensors,
-                return_attention_mask=return_attention_mask,
-                **kwargs,
-            )
-        else:
-            text_inputs = None
+        Handles edge cases like multiple colons in a line.
+        """
+        with open(text_file, 'r', encoding='utf-8') as f:
+            lines = f.readlines()
         
-        # Handle audio input
-        if audio is not None:
-            audio_inputs = self.audio_processor(
-                audio,
-                return_tensors=return_tensors,
-                **kwargs,
-            )
-        else:
-            audio_inputs = None
+        script_lines = []
+        current_speaker = 1
         
-        # Combine inputs
-        if text_inputs is not None and audio_inputs is not None:
-            # Merge text and audio inputs
-            return self._merge_inputs(text_inputs, audio_inputs)
-        elif text_inputs is not None:
-            return text_inputs
-        elif audio_inputs is not None:
-            return BatchEncoding(audio_inputs)
+        for line in lines:
+            line = line.strip()
+            if not line:
+                continue
+            
+            # Try to parse as "Speaker X: text" format
+            # Use regex to be more robust
+            speaker_match = re.match(r'^Speaker\s+(\d+)\s*:\s*(.*)$', line, re.IGNORECASE)
+            
+            if speaker_match:
+                speaker_id = int(speaker_match.group(1))
+                text = speaker_match.group(2).strip()
+                if text:
+                    script_lines.append(f"Speaker {speaker_id}: {text}")
+            else:
+                # Treat as plain text - assign to current speaker
+                script_lines.append(f"Speaker {current_speaker}: {line}")
+        
+        if not script_lines:
+            raise ValueError("No valid content found in text file")
+            
+        return "\n".join(script_lines)
+
+    def _parse_script(self, script: str) -> List[Tuple[int, str]]:
+        """Parse script into list of (speaker_id, text) tuples."""
+        lines = script.strip().split("\n")
+        parsed_lines = []
+        speaker_ids = []
+                
+        # First pass: parse all lines and collect speaker IDs
+        for line in lines:
+            if not line.strip():
+                continue
+                
+            # Use regex to handle edge cases like multiple colons
+            match = re.match(r'^Speaker\s+(\d+)\s*:\s*(.*)$', line.strip(), re.IGNORECASE)
+            
+            if match:
+                speaker_id = int(match.group(1))
+                text = ' ' + match.group(2).strip()
+                parsed_lines.append((speaker_id, text))
+                speaker_ids.append(speaker_id)
+            else:
+                logger.warning(f"Could not parse line: '{line}'")
+        
+        if not parsed_lines:
+            raise ValueError("No valid speaker lines found in script")
+        
+        # Check if we need to normalize speaker IDs (only if all are > 0)
+        min_speaker_id = min(speaker_ids)
+        if min_speaker_id > 0:
+            # Normalize to start from 0
+            normalized_lines = []
+            for speaker_id, text in parsed_lines:
+                normalized_lines.append((speaker_id - 1, text))
+            return normalized_lines
         else:
-            raise ValueError("You must provide either text, audio, or script input")
+            # Keep original IDs
+            return parsed_lines
 
     def _merge_inputs(self, text_inputs: BatchEncoding, audio_inputs: Dict) -> BatchEncoding:
         """Merge text and audio inputs into a single BatchEncoding."""
@@ -460,6 +555,27 @@ class VibePodProcessor:
         audio_processor_input_names = self.audio_processor.model_input_names
         return list(dict.fromkeys(tokenizer_input_names + audio_processor_input_names + ["speech_inputs", "speech_input_mask"]))
 
+    def save_audio(self, 
+        audio: Union[torch.Tensor, np.ndarray, List[Union[torch.Tensor, np.ndarray]]],
+        output_path: str = "output.wav",
+        sampling_rate: Optional[int] = None,
+        normalize: bool = False,
+        batch_prefix: str = "audio_",
+    ) -> str:
+        """
+        Save audio data to a file.
+        Args:
+            audio (Union[torch.Tensor, np.ndarray, List[Union[torch.Tensor, np.ndarray]]]):
+                The audio data to save. Can be a single tensor/array or a list of them.
+            output_path (str, optional): Path to save the audio file. Defaults to "output.wav".
+            sampling_rate (int, optional): Sampling rate for the audio. If None, uses the processor's default.
+            normalize (bool, optional): Whether to normalize the audio before saving. Defaults to False.
+            batch_prefix (str, optional): Prefix for batch audio files. Defaults to "audio_".
+        Returns:
+            str: The path to the saved audio file.
+        """
+        return self.audio_processor.save_audio(audio, output_path=output_path, sampling_rate=sampling_rate, normalize=normalize, batch_prefix=batch_prefix)
+    
 __all__ = [
     "VibePodProcessor",
 ]

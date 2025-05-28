@@ -242,6 +242,5 @@ __all__ = [
     "VibePodAcousticTokenizerConfig", 
     "VibePodSemanticTokenizerConfig", 
     "VibePodDiffusionHeadConfig", 
-    "VibePodDecoderConfig",
     "VibePodConfig"
 ]

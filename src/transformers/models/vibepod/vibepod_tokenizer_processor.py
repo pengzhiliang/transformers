@@ -205,7 +205,6 @@ class VibePodTokenizerProcessor(FeatureExtractionMixin):
         audio: Union[str, np.ndarray, List[float], List[np.ndarray], List[List[float]], List[str]] = None,
         sampling_rate: Optional[int] = None,
         return_tensors: Optional[str] = None,
-        streaming: bool = False,
         **kwargs,
     ):
         """
@@ -220,12 +219,10 @@ class VibePodTokenizerProcessor(FeatureExtractionMixin):
                 - List[str]: Batch of audio file paths
             sampling_rate (int, optional): Sampling rate of the input audio
             return_tensors (str, optional): Return format ('pt' for PyTorch, 'np' for NumPy)
-            streaming (bool, optional): Whether this is for streaming processing
             
         Returns:
             dict: Processed audio inputs with keys:
                 - input_features: Audio tensor(s) ready for the model
-                - streaming: Whether streaming mode is enabled
         """
         if audio is None:
             raise ValueError("Audio input is required")
@@ -282,7 +279,6 @@ class VibePodTokenizerProcessor(FeatureExtractionMixin):
         
         outputs = {
             "audio": input_features,  # Use "audio" instead of "input_features"
-            "streaming": streaming,
         }
         
         return outputs
@@ -391,13 +387,13 @@ class VibePodTokenizerProcessor(FeatureExtractionMixin):
         # Ensure audio is in the right format
         if isinstance(audio, torch.Tensor):
             # Convert PyTorch tensor to numpy
-            audio_np = audio.detach().cpu().numpy()
+            audio_np = audio.float().detach().cpu().numpy()
         elif isinstance(audio, np.ndarray):
             audio_np = audio
         elif isinstance(audio, list):
             # Handle list of tensors or arrays
             if all(isinstance(a, torch.Tensor) for a in audio):
-                audio_np = [a.detach().cpu().numpy() for a in audio]
+                audio_np = [a.float().detach().cpu().numpy() for a in audio]
             else:
                 audio_np = audio
         else:
