@@ -16,7 +16,7 @@
 import copy
 import math
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Tuple, Union
+from typing import Dict, List, Optional, Tuple, Union, Callable
 
 import torch
 import torch.nn as nn
@@ -24,17 +24,19 @@ import torch.nn.functional as F
 import numpy as np
 from tqdm import tqdm
 
+from ..auto import AutoModel, AutoModelForCausalLM
+
 from ...activations import ACT2FN
-from ...generation import GenerationMixin
-from ...modeling_outputs import CausalLMOutput, BaseModelOutputWithPast
+from ...generation import GenerationMixin, GenerationConfig, LogitsProcessor, LogitsProcessorList, StoppingCriteriaList
+from ...modeling_outputs import CausalLMOutput, BaseModelOutputWithPast, ModelOutput
 from ...modeling_utils import PreTrainedModel
 from ...modeling_flash_attention_utils import FlashAttentionKwargs
 from ...utils import LossKwargs, auto_docstring, can_return_tuple, is_torchdynamo_compiling, logging
-from ..auto import AutoModel
+
 from ..llama.modeling_llama import LlamaRMSNorm
 from ..qwen2.modeling_qwen2 import Qwen2MLP, Qwen2Attention, Qwen2DecoderLayer, Qwen2Model
 from .modular_vibepod_tokenizer import VibePodTokenizerStreamingCache, VibePodAcousticTokenizerModel, VibePodSemanticTokenizerModel
-from .modular_vibepod_diffusion_head import VibePodPredictionHead, VibePodDiffusionHeadModel
+from .modular_vibepod_diffusion_head import VibePodDiffusionHead
 from .schedule.dpm_solver import DPMSolverMultistepScheduler
 
 from .configuration_vibepod import VibePodConfig
@@ -42,6 +44,27 @@ from .configuration_vibepod import VibePodConfig
 from .modular_vibepod_text_tokenizer import VibePodTextTokenizer, VibePodTextTokenizerFast
 
 logger = logging.get_logger(__name__)
+
+import pdb
+
+@dataclass
+class VibePodCausalLMOutputWithPast(BaseModelOutputWithPast):
+    logits: Optional[torch.FloatTensor] = None
+
+
+@dataclass
+class VibePodGenerationOutput(ModelOutput):
+    """
+    Output type for VibePod generation.
+    
+    Args:
+        sequences (`torch.LongTensor` of shape `(batch_size, sequence_length)`):
+            The generated sequences. 
+        speech_outputs (`List[torch.FloatTensor]`, *optional*):
+            List of generated speech waveforms or latents for each speech segment.
+    """
+    sequences: torch.LongTensor = None
+    speech_outputs: Optional[List[torch.FloatTensor]] = None
 
 
 class SpeechConnector(nn.Module):
@@ -57,10 +80,11 @@ class SpeechConnector(nn.Module):
         x = self.fc2(x)
         return x
 
+
 @auto_docstring
 class VibePodPreTrainedModel(PreTrainedModel):
     config_class = VibePodConfig
-    base_model_prefix = ""
+    base_model_prefix = "model"
     supports_gradient_checkpointing = True
     _skip_keys_device_placement = "past_key_values"
     _supports_cache_class = True
@@ -93,36 +117,29 @@ class VibePodModel(VibePodPreTrainedModel):
         super().__init__(config)
         
         # Initialize Qwen2 model for language modeling
-        # Use decoder_config if available, otherwise use language_model_config
         lm_config = config.decoder_config 
-        self.language_model = Qwen2Model(lm_config)
+        self.language_model = AutoModel.from_config(lm_config)
         
         # Initialize speech components if needed
-        self.acoustic_tokenizer = VibePodAcousticTokenizerModel(config=config.acoustic_tokenizer_config)
-        self.semantic_tokenizer = VibePodSemanticTokenizerModel(config=config.semantic_tokenizer_config)
+        self.acoustic_tokenizer = AutoModel.from_config(config.acoustic_tokenizer_config).to(self.dtype)
+        self.semantic_tokenizer = AutoModel.from_config(config.semantic_tokenizer_config).to(self.dtype)
 
-        self.acoustic_connector = SpeechConnector(config.acostic_vae_dim, lm_config.hidden_size)
-        self.semantic_connector = SpeechConnector(config.semantic_vae_dim, lm_config.hidden_size)
+        self.acoustic_connector = SpeechConnector(config.acostic_vae_dim, lm_config.hidden_size).to(self.dtype)
+        self.semantic_connector = SpeechConnector(config.semantic_vae_dim, lm_config.hidden_size).to(self.dtype)
         
         # Register scaling factors as buffers
-        self.register_buffer('speech_scaling_factor', torch.tensor(1.0))  
-        self.register_buffer('speech_bias_factor', torch.tensor(0.0))
+        self.register_buffer('speech_scaling_factor', torch.tensor(1.0, dtype=self.dtype))  
+        self.register_buffer('speech_bias_factor', torch.tensor(0.0, dtype=self.dtype))
         
         # Initialize prediction head for speech generation
-        self.prediction_head = VibePodPredictionHead(
-            config.diffusion_head_config, 
-            latent_size=config.acostic_vae_dim
-        )
-        
+        self.prediction_head = AutoModel.from_config(config.diffusion_head_config).to(self.dtype)
+
         # Initialize noise scheduler
         self.noise_scheduler = DPMSolverMultistepScheduler(
             num_train_timesteps=config.diffusion_head_config.ddpm_num_steps,
             beta_schedule=config.diffusion_head_config.ddpm_beta_schedule,
             prediction_type=config.diffusion_head_config.prediction_type
         )
-        
-        # LM head for text generation
-        self.lm_head = nn.Linear(lm_config.hidden_size, lm_config.vocab_size, bias=False)
         
         # Initialize weights
         self.post_init()
@@ -145,6 +162,49 @@ class VibePodModel(VibePodPreTrainedModel):
         if self.semantic_tokenizer is not None:
             self.semantic_tokenizer.eval()
     
+    def forward(
+        self,
+        input_ids: torch.LongTensor = None,
+        attention_mask: Optional[torch.Tensor] = None,
+        position_ids: Optional[torch.LongTensor] = None,
+        past_key_values: Optional[Tuple[Tuple[torch.FloatTensor]]] = None,
+        inputs_embeds: Optional[torch.FloatTensor] = None,
+        use_cache: Optional[bool] = None,
+        output_attentions: Optional[bool] = None,
+        output_hidden_states: Optional[bool] = None,
+        return_dict: Optional[bool] = None,
+        cache_position: Optional[torch.LongTensor] = None,
+        **kwargs,
+    ) -> Union[Tuple, BaseModelOutputWithPast]:
+        
+        return_dict = return_dict if return_dict is not None else self.config.use_return_dict
+        
+        # Forward through language model
+        outputs = self.language_model(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            past_key_values=past_key_values,
+            inputs_embeds=inputs_embeds,
+            use_cache=use_cache,
+            output_attentions=output_attentions,
+            output_hidden_states=output_hidden_states,
+            return_dict=return_dict,
+            cache_position=cache_position,
+            **kwargs,
+        )
+        
+        if not return_dict:
+            return outputs
+            
+        return BaseModelOutputWithPast(
+            last_hidden_state=outputs.last_hidden_state,
+            past_key_values=outputs.past_key_values,
+            hidden_states=outputs.hidden_states,
+            attentions=outputs.attentions,
+        )
+
+
 class KwargsForCausalLM(FlashAttentionKwargs, LossKwargs): ...
 
 
@@ -154,13 +214,16 @@ class KwargsForCausalLM(FlashAttentionKwargs, LossKwargs): ...
     """
 )
 class VibePodForConditionalGeneration(VibePodPreTrainedModel, GenerationMixin):
-    _tied_weights_keys = ["model.lm_head.weight"]
+    _tied_weights_keys = ["lm_head.weight"]
     
     def __init__(self, config):
         super().__init__(config)
         
         # Initialize the base model
         self.model = VibePodModel(config)
+        
+        # LM head for text generation
+        self.lm_head = nn.Linear(config.decoder_config.hidden_size, config.decoder_config.vocab_size, bias=False)
         
         # inference configuration
         self.ddpm_inference_steps = config.diffusion_head_config.ddpm_num_inference_steps
@@ -173,8 +236,8 @@ class VibePodForConditionalGeneration(VibePodPreTrainedModel, GenerationMixin):
         Tie the weights between the input embeddings and the output embeddings.
         """
         # Tie lm_head.weight to language_model.embed_tokens.weight
-        if hasattr(self.model, 'lm_head') and hasattr(self.model.language_model, 'embed_tokens'):
-            self.model.lm_head.weight = self.model.language_model.embed_tokens.weight
+        if hasattr(self, 'lm_head') and hasattr(self.model.language_model, 'embed_tokens'):
+            self.lm_head.weight = self.model.language_model.embed_tokens.weight
         
     def get_input_embeddings(self):
         return self.model.get_input_embeddings()
@@ -183,10 +246,10 @@ class VibePodForConditionalGeneration(VibePodPreTrainedModel, GenerationMixin):
         self.model.set_input_embeddings(value)
     
     def get_output_embeddings(self):
-        return self.model.lm_head
+        return self.lm_head
     
     def set_output_embeddings(self, new_embeddings):
-        self.model.lm_head = new_embeddings
+        self.lm_head = new_embeddings
     
     def set_speech_tokenizers(self, acoustic_tokenizer=None, semantic_tokenizer=None):
         """Set the speech tokenizers used for encoding and decoding speech."""
@@ -213,6 +276,7 @@ class VibePodForConditionalGeneration(VibePodPreTrainedModel, GenerationMixin):
             else:
                 raise NotImplementedError(f"Speech type {speech_type} not implemented")
     
+    @can_return_tuple
     def forward(
         self,
         input_ids: torch.LongTensor = None,
@@ -225,13 +289,29 @@ class VibePodForConditionalGeneration(VibePodPreTrainedModel, GenerationMixin):
         output_attentions: Optional[bool] = None,
         output_hidden_states: Optional[bool] = None,
         return_dict: Optional[bool] = None,
+        cache_position: Optional[torch.LongTensor] = None,
         speech_tensors: Optional[torch.FloatTensor] = None,
         speech_masks: Optional[torch.BoolTensor] = None,
         speech_input_mask: Optional[torch.BoolTensor] = None,
-        acoustic_loss_mask: Optional[torch.BoolTensor] = None,
-        **kwargs,
-    ):
-        raise NotImplementedError("VibePodForConditionalGeneration does not support forward method directly. Use generate method for generation tasks.")
+        logits_to_keep: Union[int, slice] = 0,
+        **kwargs: KwargsForCausalLM,
+    ) -> Union[Tuple, VibePodCausalLMOutputWithPast]:
+        """
+        Args:
+            labels (`torch.LongTensor` of shape `(batch_size, sequence_length)`, *optional*):
+                Labels for computing the masked language modeling loss. Indices should either be in `[0, ...,
+                config.vocab_size]` or -100 (see `input_ids` docstring). Tokens with indices set to `-100` are ignored
+                (masked), the loss is only computed for the tokens with labels in `[0, ..., config.vocab_size]`.
+            speech_tensors (`torch.FloatTensor`, *optional*):
+                Input speech waveforms for voice cloning or speech understanding.
+            speech_masks (`torch.BoolTensor`, *optional*):
+                Masks indicating valid speech frames.
+            speech_input_mask (`torch.BoolTensor`, *optional*):
+                Positions in the input sequence where speech embeddings should be inserted.
+        
+        Returns:
+            `VibePodCausalLMOutputWithPast` or tuple
+        """
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
         
         # Get embeddings
@@ -240,12 +320,12 @@ class VibePodForConditionalGeneration(VibePodPreTrainedModel, GenerationMixin):
         
         # Process speech inputs if provided
         if speech_tensors is not None and speech_masks is not None:
-            _, speech_embeds = self._process_speech_inputs(speech_tensors, speech_masks)
+            acoustic_features, speech_embeds = self._process_speech_inputs(speech_tensors.to(self.dtype), speech_masks)
             if speech_input_mask is not None:
-                inputs_embeds[speech_input_mask] = speech_embeds[speech_masks]
+                inputs_embeds[speech_input_mask] = speech_embeds
         
         # Forward through language model
-        outputs = self.model.language_model(
+        outputs = self.model(
             inputs_embeds=inputs_embeds,
             attention_mask=attention_mask,
             position_ids=position_ids,
@@ -254,41 +334,228 @@ class VibePodForConditionalGeneration(VibePodPreTrainedModel, GenerationMixin):
             output_attentions=output_attentions,
             output_hidden_states=output_hidden_states,
             return_dict=return_dict,
+            cache_position=cache_position,
+            **kwargs,
         )
         
-        hidden_states = outputs[0]
-        logits = self.lm_head(hidden_states)
-        
-        loss = None
-        speech_diff_loss = None
-        
-        if labels is not None:
-            # Compute language modeling loss
-            shift_logits = logits[..., :-1, :].contiguous()
-            shift_labels = labels[..., 1:].contiguous()
-            loss_fct = nn.CrossEntropyLoss()
-            loss = loss_fct(shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1))
-            
-            # Compute speech diffusion loss if needed
-            if acoustic_loss_mask is not None and acoustic_loss_mask.sum() > 0:
-                # Extract condition features for diffusion
-                condition_features = hidden_states[acoustic_loss_mask]
+        hidden_states = outputs[0] if not return_dict else outputs.last_hidden_state
+        # logits = self.lm_head(hidden_states)
+        # Only compute necessary logits, and do not upcast them to float if we are not computing the loss
+        slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep
+        logits = self.lm_head(hidden_states[:, slice_indices, :])
                 
-                # Here you would compute the diffusion loss
-                # This is a placeholder - you'll need to adapt based on your diffusion head
-                speech_diff_loss = torch.tensor(0.0, device=hidden_states.device)
-        
-        if not return_dict:
-            output = (logits,) + outputs[1:]
-            return ((loss,) + output) if loss is not None else output
-        
-        return CausalLMOutput(
-            loss=loss,
+        if labels is not None:
+            raise NotImplementedError("Loss computation is not implemented in this version.")
+
+        return VibePodCausalLMOutputWithPast(
             logits=logits,
             past_key_values=outputs.past_key_values,
-            hidden_states=outputs.hidden_states,
+            last_hidden_state=hidden_states,
             attentions=outputs.attentions,
         )
+
+    def _build_generate_config_model_kwargs(self, inputs, tokenizer, **kwargs):
+        generation_config = GenerationConfig()
+        generation_config.bos_token_id = tokenizer.bos_token_id 
+        generation_config.eos_token_id = tokenizer.eos_token_id
+        generation_config.pad_token_id = tokenizer.pad_token_id
+        generation_config, model_kwargs = self._prepare_generation_config(generation_config, True, speech_start_id = tokenizer.speech_start_id, speech_end_id = tokenizer.speech_end_id, speech_diffusion_id = tokenizer.speech_diffusion_id, **kwargs)
+        generation_config.speech_start_id = tokenizer.speech_start_id
+        generation_config.speech_end_id = tokenizer.speech_end_id
+        generation_config.speech_diffusion_id = tokenizer.speech_diffusion_id
+
+        inputs_tensor, model_input_name, model_kwargs = self._prepare_model_inputs(inputs, generation_config.bos_token_id, model_kwargs)
+        batch_size = inputs_tensor.shape[0]
+        device = self.device
+        
+        self._prepare_special_tokens(generation_config, True, device=device)
+        generation_config.use_cache = True
+        model_kwargs["use_cache"] = generation_config.use_cache
+        input_ids = inputs_tensor.to(self.device)
+
+        input_ids_length = input_ids.shape[1]
+        has_default_max_length = kwargs.get("max_length") is None and generation_config.max_length is not None
+        has_default_min_length = kwargs.get("min_length") is None and generation_config.min_length is not None
+        generation_config = self._prepare_generated_length(
+            generation_config=generation_config,
+            has_default_max_length=has_default_max_length,
+            has_default_min_length=has_default_min_length,
+            model_input_name=model_input_name,
+            inputs_tensor=inputs_tensor,
+            input_ids_length=input_ids_length,
+        )
+
+        max_cache_length = generation_config.max_length - 1
+        self._prepare_cache_for_generation(generation_config, model_kwargs, None, batch_size, max_cache_length, device)
+        model_kwargs['cache_position'] = torch.arange(input_ids_length, device=device, dtype=torch.long)
+        for k, v in model_kwargs.items():
+            if isinstance(v, torch.Tensor):
+                model_kwargs[k] = v.to(device=device)
+        
+        return generation_config, model_kwargs, input_ids
+
+    @torch.no_grad()
+    def generate(
+        self,
+        inputs: Optional[torch.Tensor] = None,
+        generation_config: Optional[GenerationConfig] = None,
+        logits_processor: Optional[LogitsProcessorList] = None,
+        stopping_criteria: Optional[StoppingCriteriaList] = None,
+        prefix_allowed_tokens_fn: Optional[Callable[[int, torch.Tensor], List[int]]] = None,
+        synced_gpus: Optional[bool] = None,
+        assistant_model: Optional["PreTrainedModel"] = None,
+        streamer: Optional["BaseStreamer"] = None,
+        negative_prompt_ids: Optional[torch.Tensor] = None,
+        negative_prompt_attention_mask: Optional[torch.Tensor] = None,
+        speech_tensors: Optional[torch.FloatTensor] = None,
+        speech_masks: Optional[torch.BoolTensor] = None,
+        speech_input_mask: Optional[torch.BoolTensor] = None,
+        return_speech: bool = True,
+        cfg_scale: float = 1.0,
+        do_sample: bool = False,
+        **kwargs,
+    ) -> Union[torch.LongTensor, VibePodGenerationOutput]:
+        """
+        Generates sequences of token ids and optionally speech outputs.
+        
+        Args:
+            All standard generation arguments from GenerationMixin
+            negative_prompt_ids: Negative prompt for CFG in speech generation
+            negative_prompt_attention_mask: Attention mask for negative prompt
+            speech_tensors: Input speech for voice cloning
+            speech_masks: Masks for speech tensors  
+            speech_input_mask: Positions to insert speech embeddings
+            return_speech: Whether to decode and return speech outputs
+            cfg_scale: CFG scale for speech generation
+ 
+        Returns:
+            Generated token sequences and optionally speech outputs
+        """
+        # 1. Handle `generation_config` and kwargs that might update it, and validate the `.generate()` call
+        tokenizer = kwargs.pop("tokenizer", None)  # Pull this out first, we only use it for stopping criteria
+        parsed_scripts = kwargs.pop("parsed_scripts", None)
+        all_speakers_list = kwargs.pop("all_speakers_list", None)
+
+        generation_config, model_kwargs, input_ids = self._build_generate_config_model_kwargs(
+            inputs, tokenizer, **kwargs
+        )
+        pdb.set_trace()
+        negative_kwargs = {
+            'input_ids': torch.full((kwargs['input_ids'].shape[0], 1), tokenizer.speech_start_id, dtype=torch.long, device=kwargs['input_ids'].device),
+            'attention_mask':  torch.ones((kwargs['input_ids'].shape[0], 1), dtype=torch.long, device=kwargs['input_ids'].device),
+            'max_new_tokens': kwargs.get('max_new_tokens', 100) 
+        }
+        negative_generation_config, negative_model_kwargs, negative_input_ids = self._build_generate_config_model_kwargs(
+            None, tokenizer, **negative_kwargs
+        )
+
+        logits_processor = LogitsProcessorList()
+
+        acoustic_cache = VibePodTokenizerStreamingCache()
+        semantic_cache = VibePodTokenizerStreamingCache()
+        
+        batch_size = input_ids.shape[0]
+        device = input_ids.device
+        finished_tags = torch.ones(batch_size, dtype=torch.bool, device=device)
+        is_prefill = True
+        inputs_embeds = None
+        while finished_tags.any():
+            model_inputs = self.prepare_inputs_for_generation(input_ids, **model_kwargs)
+            if is_prefill:
+                # we process the speech inputs only during the first generation step
+                prefill_inputs = {
+                    "speech_tensors": speech_tensors.to(device=device),
+                    "speech_masks": speech_masks.to(device),
+                    "speech_input_mask": speech_input_mask.to(device),
+                }
+                is_prefill = False
+            else:
+                _ = model_inputs.pop('inputs_embeds', None)
+                prefill_inputs = {'inputs_embeds': inputs_embeds}
+            # Forward pass through the model
+            outputs = self(
+                **model_inputs, **prefill_inputs, logits_to_keep=1, return_dict=True, output_attentions=False, output_hidden_states=False,
+            )
+            model_kwargs = self._update_model_kwargs_for_generation(
+                outputs, model_kwargs, is_encoder_decoder=False,
+            )
+
+            # Get logits and apply logits processor
+            next_token_logits = outputs.logits[:, -1, :].to(copy=True, dtype=torch.float32, device=input_ids.device)
+            next_token_scores = logits_processor(input_ids, next_token_logits)
+            # token selection
+            if do_sample:
+                probs = nn.functional.softmax(next_token_scores, dim=-1)
+                # TODO (joao): this OP throws "skipping cudagraphs due to ['incompatible ops']", find solution
+                next_tokens = torch.multinomial(probs, num_samples=1).squeeze(1)
+            else:
+                next_tokens = torch.argmax(next_token_scores, dim=-1)
+
+            input_ids = torch.cat([input_ids, next_tokens[:, None]], dim=-1)
+            
+            # speech_end
+            diffusion_end_indices = (next_tokens == generation_config.speech_end_id).nonzero(as_tuple=False).squeeze(1)
+            if diffusion_end_indices.numel() > 0:
+                # some speech segmens reach end
+                pass
+            
+            # speech_begin
+            diffusion_start_indices = (next_tokens == generation_config.speech_start_id).nonzero(as_tuple=False).squeeze(1)
+            if diffusion_start_indices.numel() > 0:
+                pass
+            
+            # forward diffusion
+            diffusion_indices = (next_tokens == generation_config.speech_diffusion_id).nonzero(as_tuple=False).squeeze(1)
+            if diffusion_indices.numel() > 0:
+                # 
+                negative_model_inputs = self.prepare_inputs_for_generation(negative_input_ids, **negative_model_kwargs)
+                # Forward negative pass through the model
+                if negative_model_inputs['inputs_embeds'] is None and inputs_embeds is not None:
+                    negative_model_inputs['inputs_embeds'] = inputs_embeds
+                    negative_model_inputs['input_ids'] = None
+
+                negative_outputs = self(
+                    **negative_model_inputs, logits_to_keep=0, return_dict=True, output_attentions=False, output_hidden_states=False,
+                )
+                negative_model_kwargs = self._update_model_kwargs_for_generation(
+                    negative_outputs, negative_model_kwargs, is_encoder_decoder=False,
+                )
+                negative_input_ids = torch.cat([negative_input_ids, next_tokens[:, None]], dim=-1)
+
+                positive_condition = outputs.last_hidden_state[diffusion_indices, -1, :]
+                negative_condition = negative_outputs.last_hidden_state[diffusion_indices, -1, :]
+                
+                speech_latent = self.sample_speech_tokens(
+                    positive_condition,
+                    negative_condition,
+                    cfg_scale=cfg_scale,
+                ).unsqueeze(1)
+                                
+                # Decode acoustic latent to audio using acoustic streaming cache
+                scaled_latent = speech_latent / self.model.speech_scaling_factor - self.model.speech_bias_factor
+                audio_chunk = self.model.acoustic_tokenizer.decode(
+                    scaled_latent,
+                    cache=acoustic_cache,  # Use acoustic-specific cache
+                    sample_indices=diffusion_indices,
+                    use_cache=True,
+                    debug=False
+                )
+                
+                # Encode audio to semantic features using semantic streaming cache
+                semantic_features = self.model.semantic_tokenizer.encode(
+                    audio_chunk,
+                    cache=semantic_cache,  # Use semantic-specific cache
+                    sample_indices=diffusion_indices,
+                    use_cache=True,
+                    debug=False
+                ).mean
+                
+                # Combine acoustic and semantic features for next input
+                acoustic_embed = self.model.acoustic_connector(speech_latent)
+                semantic_embed = self.model.semantic_connector(semantic_features)
+                inputs_embeds = acoustic_embed + semantic_embed
+
+        return None
     
     @torch.no_grad()
     def sample_speech_tokens(self, condition, neg_condition, cfg_scale=3.0):
@@ -304,6 +571,13 @@ class VibePodForConditionalGeneration(VibePodPreTrainedModel, GenerationMixin):
             eps = torch.cat([half_eps, half_eps], dim=0)
             speech = self.model.noise_scheduler.step(eps, t, speech).prev_sample
         return speech[: len(speech) // 2]
+    
+    
+    def _extract_and_decode_speech(self, token_ids):
+        """Extract speech segments from generated tokens and decode them."""
+        # This would parse token_ids for speech segments and decode them
+        # Placeholder implementation
+        return []
 
     @torch.no_grad()
     def generate_multiple_speeches_semantic_acoustic(
@@ -435,7 +709,7 @@ class VibePodForConditionalGeneration(VibePodPreTrainedModel, GenerationMixin):
             past_key_values = outputs.past_key_values
             
             # Get logits and sample next token
-            logits = self.model.lm_head(hidden_states)
+            logits = self.lm_head(hidden_states)
             
             if temperature > 0:
                 probs = torch.softmax(logits / temperature, dim=-1)
@@ -556,7 +830,7 @@ class VibePodForConditionalGeneration(VibePodPreTrainedModel, GenerationMixin):
         
         return output_tokens, output_speech
 
-
+  
 def sample_top_p(probs, p):
     """Sample from top-p (nucleus) distribution."""
     probs_sort, probs_idx = torch.sort(probs, dim=-1, descending=True)
@@ -568,6 +842,12 @@ def sample_top_p(probs, p):
     next_token = torch.gather(probs_idx, -1, next_token)
     return next_token.squeeze(-1)
 
+AutoModel.register(VibePodConfig, VibePodModel)
+AutoModelForCausalLM.register(VibePodConfig, VibePodForConditionalGeneration)
+
 __all__ = [
+    "VibePodModel",
     "VibePodForConditionalGeneration",
+    # "VibePodCausalLMOutputWithPast",
+    "VibePodGenerationOutput",
 ]

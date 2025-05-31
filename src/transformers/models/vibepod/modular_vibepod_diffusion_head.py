@@ -20,6 +20,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from ..auto import AutoModel
 from ...modeling_utils import PreTrainedModel
 from ...activations import ACT2FN
 from ...utils import logging
@@ -53,10 +54,14 @@ class RMSNorm(nn.Module):
     def extra_repr(self) -> str:
         return f'dim={self.dim}, eps={self.eps}, elementwise_affine={self.elementwise_affine}'
     
-def modulate(x, shift, scale):
-    """Apply modulation to input tensor."""
-    return x * (1 + scale) + shift
+# def modulate(x, shift, scale):
+#     """Apply modulation to input tensor."""
+#     return x * (1 + scale) + shift
 
+@torch.jit.script
+def modulate(x: torch.Tensor, shift: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
+    """Fused modulation operation for better performance."""
+    return x * (1 + scale) + shift
 
 class TimestepEmbedder(nn.Module):
     """
@@ -70,7 +75,8 @@ class TimestepEmbedder(nn.Module):
         super().__init__()
         self.mlp = nn.Sequential(
             nn.Linear(frequency_embedding_size, hidden_size, bias=False),
-            nn.SiLU(),
+            # nn.SiLU(),
+            ACT2FN['silu'],
             nn.Linear(hidden_size, hidden_size, bias=False),
         )
         self.frequency_embedding_size = frequency_embedding_size
@@ -123,29 +129,17 @@ class FeedForwardNetwork(nn.Module):
         self.gate_proj = nn.Linear(self.embed_dim, ffn_dim, bias=False)
         self.up_proj = nn.Linear(self.embed_dim, ffn_dim, bias=False)
         self.down_proj = nn.Linear(ffn_dim, self.embed_dim, bias=False)
+        self.act_fn = ACT2FN['silu']  # Using SiLU as the activation function
 
     def forward(self, x):
         gate = self.gate_proj(x)
         up = self.up_proj(x)
         
         # SwiGLU activation
-        gate = F.silu(gate)
+        # gate = F.silu(gate)
+        gate = self.act_fn(gate)
         return self.down_proj(gate * up)
 
-# class VibePodMLP(nn.Module):
-#     def __init__(self, config):
-#         super().__init__()
-#         self.config = config
-#         self.hidden_size = config.hidden_size
-#         self.intermediate_size = config.intermediate_size
-#         self.gate_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=False)
-#         self.up_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=False)
-#         self.down_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=False)
-#         self.act_fn = ACT2FN[config.hidden_act]
-
-#     def forward(self, x):
-#         down_proj = self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
-#         return down_proj
     
 class HeadLayer(nn.Module):
     """
@@ -174,7 +168,8 @@ class HeadLayer(nn.Module):
         )
         self.norm = RMSNorm(self.embed_dim, eps=norm_eps)
         self.adaLN_modulation = nn.Sequential(
-            nn.SiLU(),
+            # nn.SiLU(),
+            ACT2FN['silu'],
             nn.Linear(cond_dim, 3 * self.embed_dim, bias=False)
         )
 
@@ -199,7 +194,8 @@ class FinalLayer(nn.Module):
         self.norm_final = RMSNorm(hidden_size, eps=norm_eps, elementwise_affine=False)
         self.linear = nn.Linear(hidden_size, output_size, bias=False)
         self.adaLN_modulation = nn.Sequential(
-            nn.SiLU(),
+            # nn.SiLU(),
+            ACT2FN['silu'],
             nn.Linear(cond_size, 2 * hidden_size, bias=False)
         )
 
@@ -210,23 +206,24 @@ class FinalLayer(nn.Module):
         return x
 
 
-class VibePodPredictionHead(nn.Module):
+class VibePodDiffusionHead(PreTrainedModel):
     """
-    Prediction head for diffusion models in VibePod.
+    Diffusion head model for VibePod.
     
     Args:
         config (`VibePodDiffusionHeadConfig`): Model configuration
-        latent_size (`int`, optional): Size of the latent space
+        latent_size (`int`, optional): Size of the latent space. If not provided, uses `config.latent_size`.
     """
+    config_class = VibePodDiffusionHeadConfig
+
     def __init__(
         self,
         config,
-        latent_size=None,
     ):
-        super().__init__()
+        super().__init__(config)
         self.config = config
         self.cond_dim = config.hidden_size
-        latent_size = latent_size or config.latent_size
+        latent_size = config.latent_size
         
         self.noisy_images_proj = nn.Linear(latent_size, config.hidden_size, bias=False)
         self.cond_proj = nn.Linear(config.hidden_size, self.cond_dim, bias=False)
@@ -298,27 +295,8 @@ class VibePodPredictionHead(nn.Module):
         return x
 
 
-class VibePodDiffusionHeadModel(PreTrainedModel):
-    """
-    Diffusion head model for VibePod.
-    
-    Args:
-        config (`VibePodDiffusionHeadConfig`): Model configuration
-    """
-    config_class = VibePodDiffusionHeadConfig
-    
-    def __init__(self, config):
-        super().__init__(config)
-        
-        self.speech_prediction_head = VibePodPredictionHead(
-            config,
-            latent_size=config.speech_vae_dim,
-        )
-    
-    def forward(
-        self,
-        noisy_latents,
-        timesteps,
-        condition,
-    ):
-        return self.speech_prediction_head(noisy_latents, timesteps, condition)
+AutoModel.register(VibePodDiffusionHeadConfig, VibePodDiffusionHead)
+
+__all__ = [
+    "VibePodDiffusionHead",
+]

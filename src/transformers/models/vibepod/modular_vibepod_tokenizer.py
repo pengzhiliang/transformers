@@ -25,9 +25,12 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from ..auto import AutoModel
+
 from ...configuration_utils import PretrainedConfig
 from ...utils import logging
 from ...modeling_utils import PreTrainedModel
+from ...activations import ACT2FN
 
 from .configuration_vibepod import VibePodAcousticTokenizerConfig, VibePodSemanticTokenizerConfig
 
@@ -225,7 +228,6 @@ class VibePodTokenizerStreamingCache:
                 key = (layer_id, idx)
                 self.cache.pop(key, None)
 
-
 class SConv1d(nn.Module):
     """Conv1d with built-in handling of asymmetric or causal padding and normalization."""
     def __init__(self, in_channels: int, out_channels: int,
@@ -255,7 +257,7 @@ class SConv1d(nn.Module):
         
         # Create a unique layer ID for cache management
         self._layer_id = None
-        
+                  
     @property
     def layer_id(self):
         if self._layer_id is None:
@@ -291,7 +293,16 @@ class SConv1d(nn.Module):
         assert sample_indices is not None, "sample_indices must be provided for streaming mode"
         assert len(sample_indices) == B, "sample_indices must match batch size"
         
-        # Get cached states
+        return self._forward_streaming(x, cache, sample_indices, debug)
+    
+    def _forward_streaming(self, x: torch.Tensor, 
+                          cache: VibePodTokenizerStreamingCache,
+                          sample_indices: torch.Tensor,
+                          debug: bool = False) -> torch.Tensor:
+        """Streaming forward pass with cache operations kept separate from compiled code"""
+        B, C, T = x.shape
+        
+        # Cache operations (not compiled)
         cached_states = cache.get(self.layer_id, sample_indices)
         
         if cached_states is None:
@@ -317,12 +328,11 @@ class SConv1d(nn.Module):
         # Apply convolution directly - no extra padding in streaming mode
         # The conv layer will handle its own padding internally
         output = self.conv(input_with_context)
-        
+
         if debug:
             print(f"[DEBUG] Output shape: {output.shape}")
         
         # Update cache for next chunk
-        # We need to keep the last context_size samples for the next iteration
         if self.context_size > 0:
             # Calculate how many samples to keep
             total_input_length = input_with_context.shape[2]
@@ -378,6 +388,7 @@ class SConv1d(nn.Module):
         
         return output
 
+
 class SConvTranspose1d(nn.Module):
     """ConvTranspose1d with built-in handling of asymmetric or causal padding and normalization."""
     def __init__(self, in_channels: int, out_channels: int,
@@ -408,7 +419,7 @@ class SConvTranspose1d(nn.Module):
         
         # Create a unique layer ID for cache management
         self._layer_id = None
-    
+
     @property
     def layer_id(self):
         if self._layer_id is None:
@@ -422,16 +433,6 @@ class SConvTranspose1d(nn.Module):
                 debug: bool = False) -> torch.Tensor:
         """
         Forward pass with optional streaming support via cache.
-        
-        Args:
-            x: Input tensor [batch_size, channels, time]
-            cache: VibePodTokenizerStreamingCache object for maintaining states
-            sample_indices: Indices identifying each sample for cache management
-            use_cache: Whether to use cached states for streaming
-            debug: Whether to print debug information
-            
-        Returns:
-            Output tensor
         """
         B, C, T = x.shape
         
@@ -443,7 +444,16 @@ class SConvTranspose1d(nn.Module):
         assert sample_indices is not None, "sample_indices must be provided for streaming mode"
         assert len(sample_indices) == B, "sample_indices must match batch size"
         
-        # Get cached states (input history for transposed conv)
+        return self._forward_streaming(x, cache, sample_indices, debug)
+    
+    def _forward_streaming(self, x: torch.Tensor,
+                          cache: VibePodTokenizerStreamingCache,
+                          sample_indices: torch.Tensor,
+                          debug: bool = False) -> torch.Tensor:
+        """Streaming forward pass with cache operations kept separate from compiled code"""
+        B, C, T = x.shape
+        
+        # Cache operations (not compiled)
         cached_input = cache.get(self.layer_id, sample_indices)
         
         if cached_input is None:
@@ -458,10 +468,7 @@ class SConvTranspose1d(nn.Module):
         if debug:
             print(f"[DEBUG] Input shape: {x.shape}, Cache shape: {cached_input.shape}, Combined: {full_input.shape}")
         
-        # For transposed convolution in streaming mode, we need to handle output generation carefully
-        # The key insight: each input sample can affect multiple output samples
-        
-        # Apply transposed convolution to the full input
+        # First chunk or debug mode - use uncompiled version
         full_output = self.convtr(full_input)
         
         if debug:
@@ -483,13 +490,11 @@ class SConvTranspose1d(nn.Module):
             print(f"[DEBUG] After unpadding: {full_output.shape}")
         
         # Determine which part of the output corresponds to the new input
-        # For streaming, we only want the output that corresponds to the new input samples
         if cached_input.shape[2] == 0:
             # First chunk - return all output
             output = full_output
         else:
             # Subsequent chunks - return only the new output
-            # The number of new output samples should be approximately T * stride
             expected_new_output = T * self.stride
             
             # Take the last expected_new_output samples
@@ -501,8 +506,7 @@ class SConvTranspose1d(nn.Module):
         if debug:
             print(f"[DEBUG] Final streaming output shape: {output.shape}")
         
-        # Update cache: keep recent input samples for next iteration
-        # We need to keep enough context for the transposed convolution
+        # Update cache
         if full_input.shape[2] > self.context_size:
             new_cache = full_input[:, :, -self.context_size:]
         else:
@@ -541,9 +545,8 @@ class SConvTranspose1d(nn.Module):
             print(f"[DEBUG NON-STREAMING] Final output shape: {y.shape}")
             
         return y
-
-
-# FFN and Convolution layers
+    
+# FFN 
 class FFN(nn.Module):
     def __init__(
         self,
@@ -554,7 +557,7 @@ class FFN(nn.Module):
         super().__init__()
         self.embed_dim = embed_dim
         self.linear1 = nn.Linear(self.embed_dim, ffn_dim, bias=bias) 
-        self.gelu = nn.GELU()
+        self.gelu = ACT2FN["gelu"]
         self.linear2 = nn.Linear(ffn_dim, self.embed_dim, bias=bias)
 
     def forward(self, x):
@@ -759,7 +762,7 @@ class TokenizerEncoder(nn.Module):
                     x = block.mixer.conv(x, cache=cache, sample_indices=sample_indices, use_cache=use_cache, debug=debug)
                     if block.gamma is not None:
                         x = x * block.gamma.unsqueeze(-1)
-                    x = residual + block.drop_path(x)
+                    x = residual + x
                     
                     # FFN part
                     residual = x
@@ -769,7 +772,7 @@ class TokenizerEncoder(nn.Module):
                     x = x.permute(0, 2, 1)
                     if block.ffn_gamma is not None:
                         x = x * block.ffn_gamma.unsqueeze(-1)
-                    x = residual + block.drop_path(x)
+                    x = residual + x
                 else:
                     x = block(x)
 
@@ -897,7 +900,7 @@ class TokenizerDecoder(nn.Module):
                     x = block.mixer.conv(x, cache=cache, sample_indices=sample_indices, use_cache=use_cache, debug=debug)
                     if block.gamma is not None:
                         x = x * block.gamma.unsqueeze(-1)
-                    x = residual + block.drop_path(x)
+                    x = residual + x
                     
                     # FFN part
                     residual = x
@@ -907,7 +910,7 @@ class TokenizerDecoder(nn.Module):
                     x = x.permute(0, 2, 1)
                     if block.ffn_gamma is not None:
                         x = x * block.ffn_gamma.unsqueeze(-1)
-                    x = residual + block.drop_path(x)
+                    x = residual + x
                 else:
                     x = block(x)
 
@@ -1147,6 +1150,9 @@ class VibePodSemanticTokenizerModel(PreTrainedModel):
         encoder_output = self.encode(audio, cache=cache, sample_indices=sample_indices, use_cache=use_cache, debug=debug)
         sampled_latents, _ = self.sampling(encoder_output, dist_type='none')
         return None, sampled_latents
+
+AutoModel.register(VibePodAcousticTokenizerConfig, VibePodAcousticTokenizerModel)
+AutoModel.register(VibePodSemanticTokenizerConfig, VibePodSemanticTokenizerModel)
 
 __all__ = [
     "VibePodTokenizerStreamingCache",

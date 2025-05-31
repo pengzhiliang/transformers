@@ -29,8 +29,6 @@ import torch
 import soundfile as sf
 import librosa
 
-from transformers.models.vibepod.modeling_vibepod import VibePodForConditionalGeneration
-
 from transformers.models.vibepod.vibepod_processor import VibePodProcessor
 from transformers.models.vibepod.vibepod_tokenizer_processor import AudioNormalizer
 from transformers.tokenization_utils_base import PaddingStrategy
@@ -60,9 +58,24 @@ def parse_args():
         help="Test batch input processing",
     )
     parser.add_argument(
+        "--test_padding",
+        action="store_true",
+        help="Test different padding strategies",
+    )
+    parser.add_argument(
+        "--test_truncation",
+        action="store_true",
+        help="Test truncation functionality",
+    )
+    parser.add_argument(
+        "--test_tensors",
+        action="store_true",
+        help="Test different tensor return types",
+    )
+    parser.add_argument(
         "--voice_samples_dir",
         type=str,
-        default='/mnt/conversationhub/zhiliang/other/',
+        default=None,
         help="Directory containing voice samples",
     )
     parser.add_argument(
@@ -178,7 +191,29 @@ def test_batch_input(processor: VibePodProcessor, scripts: Dict[str, Any], voice
         return_attention_mask=True,
     )
     
-    return result
+    print(f"   - Batch size: {result['input_ids'].shape[0]}")
+    print(f"   - Max sequence length: {result['input_ids'].shape[1]}")
+    print(f"   - Attention mask shape: {result['attention_mask'].shape}")
+    
+    # Check padding
+    print("\n2. Checking padding correctness:")
+    for i in range(len(batch_texts)):
+        non_pad_tokens = (result['attention_mask'][i] == 1).sum().item()
+        print(f"   - Sample {i}: {non_pad_tokens} non-padded tokens")
+    
+    # Test without padding
+    print("\n3. Testing batch without padding:")
+    result_no_pad = processor(
+        text=batch_texts,
+        voice_samples=batch_voice_samples,
+        padding=False,
+        return_attention_mask=True,
+    )
+    
+    print(f"   - Result is list: {isinstance(result_no_pad['input_ids'], list)}")
+    print(f"   - Sequence lengths: {[len(seq) for seq in result_no_pad['input_ids']]}")
+    
+    return True
 
 
 def test_padding_strategies(processor: VibePodProcessor, scripts: Dict[str, Any]):
@@ -224,6 +259,136 @@ def test_padding_strategies(processor: VibePodProcessor, scripts: Dict[str, Any]
     return True
 
 
+def test_truncation(processor: VibePodProcessor, scripts: Dict[str, Any]):
+    """Test truncation functionality"""
+    print("\n" + "="*50)
+    print("Testing Truncation")
+    print("="*50)
+    
+    # Use long script
+    long_text = scripts["long_script"]
+    
+    # Process without truncation
+    print("\n1. Without truncation:")
+    result_full = processor(
+        text=long_text,
+        truncation=False,
+        return_tensors="pt",
+    )
+    full_length = result_full['input_ids'].shape[1]
+    print(f"   - Full sequence length: {full_length}")
+    
+    # Process with truncation
+    max_len = 200
+    print(f"\n2. With truncation (max_length={max_len}):")
+    result_trunc = processor(
+        text=long_text,
+        truncation=True,
+        max_length=max_len,
+        padding="max_length",
+        return_tensors="pt",
+    )
+    print(f"   - Truncated sequence length: {result_trunc['input_ids'].shape[1]}")
+    
+    # Test batch truncation
+    print("\n3. Batch truncation:")
+    batch_texts = [scripts["long_script"], "Speaker 1: Short text"]
+    result_batch = processor(
+        text=batch_texts,
+        truncation=True,
+        max_length=150,
+        padding=True,
+        return_tensors="pt",
+    )
+    print(f"   - Batch shape: {result_batch['input_ids'].shape}")
+    
+    return True
+
+
+def test_tensor_types(processor: VibePodProcessor, scripts: Dict[str, Any]):
+    """Test different tensor return types"""
+    print("\n" + "="*50)
+    print("Testing Tensor Return Types")
+    print("="*50)
+    
+    test_text = scripts["single_speaker"]
+    
+    # PyTorch tensors
+    print("\n1. PyTorch tensors:")
+    result_pt = processor(
+        text=test_text,
+        return_tensors="pt",
+    )
+    print(f"   - Type: {type(result_pt['input_ids'])}")
+    print(f"   - Device: {result_pt['input_ids'].device}")
+    
+    # NumPy arrays
+    print("\n2. NumPy arrays:")
+    result_np = processor(
+        text=test_text,
+        return_tensors="np",
+    )
+    print(f"   - Type: {type(result_np['input_ids'])}")
+    print(f"   - Dtype: {result_np['input_ids'].dtype}")
+    
+    # Python lists
+    print("\n3. Python lists (no return_tensors):")
+    result_list = processor(
+        text=test_text,
+        return_tensors=None,
+    )
+    print(f"   - Type: {type(result_list['input_ids'])}")
+    
+    # Test with device placement (PyTorch only)
+    if torch.cuda.is_available():
+        print("\n4. Testing device placement:")
+        device = torch.device("cuda:0")
+        result_cuda = processor(
+            text=test_text,
+            return_tensors="pt",
+        )
+        # Move to CUDA after processing
+        result_cuda['input_ids'] = result_cuda['input_ids'].to(device)
+        print(f"   - Device after moving: {result_cuda['input_ids'].device}")
+    
+    return True
+
+
+def test_edge_cases(processor: VibePodProcessor):
+    """Test edge cases and error handling"""
+    print("\n" + "="*50)
+    print("Testing Edge Cases")
+    print("="*50)
+    
+    # Empty input
+    print("\n1. Testing empty input:")
+    try:
+        result = processor(text="", return_tensors="pt")
+        print(f"   - Handled empty input, shape: {result['input_ids'].shape}")
+    except Exception as e:
+        print(f"   - Error (expected): {type(e).__name__}: {e}")
+    
+    # Mixed batch with empty
+    print("\n2. Testing batch with empty string:")
+    try:
+        result = processor(
+            text=["Speaker 1: Hello", "", "Speaker 2: World"],
+            padding=True,
+            return_tensors="pt",
+        )
+        print(f"   - Handled mixed batch, shape: {result['input_ids'].shape}")
+    except Exception as e:
+        print(f"   - Error: {type(e).__name__}: {e}")
+    
+    # Very long speaker ID
+    print("\n3. Testing unusual speaker IDs:")
+    unusual_script = "Speaker 999: Testing large speaker ID\nSpeaker 0: Testing zero ID"
+    result = processor(text=unusual_script, return_tensors="pt")
+    print(f"   - Processed successfully, shape: {result['input_ids'].shape}")
+    
+    return True
+
+
 def main():
     args = parse_args()
     
@@ -231,19 +396,9 @@ def main():
     
     # Load processor
     processor = VibePodProcessor.from_pretrained(
-        '/tmp/vibepod-model',
+        args.model_path,
         cache_dir="/mnt/msranlp/zliang/hf_ckpt"
     )
-
-    # Load model
-    model = VibePodForConditionalGeneration.from_pretrained(
-        args.model_path,
-        torch_dtype="auto",
-        device_map=args.device,
-    )
-    model.eval()
-    
-    model.set_ddpm_inference_steps(num_steps=10)
     
     # Load voice samples if provided
     voice_samples = None
@@ -255,29 +410,31 @@ def main():
     # Create test scripts
     scripts = create_test_scripts()
     
-
-    # if all_tests or args.test_single:
-    #     test_single_input(processor, scripts, voice_samples)
+    # Run tests based on arguments
+    all_tests = not any([args.test_single, args.test_batch, args.test_padding, 
+                         args.test_truncation, args.test_tensors])
     
-    # if all_tests or args.test_batch:
-    inputs = test_batch_input(processor, scripts, voice_samples)
+    if all_tests or args.test_single:
+        test_single_input(processor, scripts, voice_samples)
     
-    # if all_tests or args.test_padding:
-    #     test_padding_strategies(processor, scripts)
-
-    model.generate(
-        **inputs,
-        max_new_tokens=100,
-        cfg_scale=1.5,
-        tokenizer=processor.tokenizer,
-    )
+    if all_tests or args.test_batch:
+        test_batch_input(processor, scripts, voice_samples)
+    
+    if all_tests or args.test_padding:
+        test_padding_strategies(processor, scripts)
+    
+    if all_tests or args.test_truncation:
+        test_truncation(processor, scripts)
+    
+    if all_tests or args.test_tensors:
+        test_tensor_types(processor, scripts)
     
     # Always test edge cases
-    # test_edge_cases(processor)
+    test_edge_cases(processor)
     
-    # print("\n" + "="*50)
-    # print("All tests completed!")
-    # print("="*50)
+    print("\n" + "="*50)
+    print("All tests completed!")
+    print("="*50)
 
 
 if __name__ == "__main__":

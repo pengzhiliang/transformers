@@ -24,8 +24,7 @@ logger = logging.get_logger(__name__)
 
 
 class VibePodAcousticTokenizerConfig(PretrainedConfig):
-    model_type = "vibepod"
-    base_config_key = "acoustic_tokenizer"
+    model_type = "vibepod_acoustic_tokenizer"
 
     def __init__(
         self,
@@ -88,8 +87,7 @@ class VibePodAcousticTokenizerConfig(PretrainedConfig):
 
 
 class VibePodSemanticTokenizerConfig(PretrainedConfig):
-    model_type = "vibepod"
-    base_config_key = "semantic_tokenizer"
+    model_type = "vibepod_semantic_tokenizer"
     
     def __init__(
         self,
@@ -143,8 +141,7 @@ class VibePodSemanticTokenizerConfig(PretrainedConfig):
         
 
 class VibePodDiffusionHeadConfig(PretrainedConfig):
-    model_type = "vibepod"
-    base_config_key = "diffusion_head"
+    model_type = "vibepod_diffusion_head"
 
     def __init__(
         self,
@@ -152,7 +149,7 @@ class VibePodDiffusionHeadConfig(PretrainedConfig):
         head_layers=4,
         head_ffn_ratio=3.0,
         rms_norm_eps=1e-5,
-        latent_size=16,
+        latent_size=64,
         speech_vae_dim=None,
         prediction_type="v_prediction",
         diffusion_type="ddpm",
@@ -179,6 +176,7 @@ class VibePodDiffusionHeadConfig(PretrainedConfig):
 
 class VibePodConfig(PretrainedConfig):
     model_type = "vibepod"
+    is_composition = True
     sub_configs = {
         "acoustic_tokenizer_config": VibePodAcousticTokenizerConfig, 
         "semantic_tokenizer_config": VibePodSemanticTokenizerConfig,
@@ -199,7 +197,7 @@ class VibePodConfig(PretrainedConfig):
         if acoustic_tokenizer_config is None:
             self.acoustic_tokenizer_config = self.sub_configs["acoustic_tokenizer_config"]()
         elif isinstance(acoustic_tokenizer_config, dict):
-            # If a dictionary is provided, instantiate the config class with it
+            acoustic_tokenizer_config["model_type"] = "vibepod_acoustic_tokenizer"
             self.acoustic_tokenizer_config = self.sub_configs["acoustic_tokenizer_config"](**acoustic_tokenizer_config)
         elif isinstance(acoustic_tokenizer_config, VibePodAcousticTokenizerConfig):
             # If an instance of the config class is provided
@@ -208,7 +206,7 @@ class VibePodConfig(PretrainedConfig):
         if semantic_tokenizer_config is None:
             self.semantic_tokenizer_config = self.sub_configs["semantic_tokenizer_config"]()
         elif isinstance(semantic_tokenizer_config, dict):
-            # If a dictionary is provided, instantiate the config class with it
+            semantic_tokenizer_config["model_type"] = "vibepod_semantic_tokenizer"
             self.semantic_tokenizer_config = self.sub_configs["semantic_tokenizer_config"](**semantic_tokenizer_config)
         elif isinstance(semantic_tokenizer_config, VibePodSemanticTokenizerConfig):
             # If an instance of the config class is provided
@@ -226,7 +224,7 @@ class VibePodConfig(PretrainedConfig):
         if diffusion_head_config is None:
             self.diffusion_head_config = self.sub_configs["diffusion_head_config"]()
         elif isinstance(diffusion_head_config, dict):
-            # If a dictionary is provided, instantiate the config class with it
+            diffusion_head_config["model_type"] = "vibepod_diffusion_head"
             self.diffusion_head_config = self.sub_configs["diffusion_head_config"](**diffusion_head_config)
         elif isinstance(diffusion_head_config, VibePodDiffusionHeadConfig):
             # If an instance of the config class is provided

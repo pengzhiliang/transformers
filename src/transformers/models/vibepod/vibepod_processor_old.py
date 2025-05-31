@@ -11,7 +11,6 @@ from ...tokenization_utils_base import BatchEncoding, PaddingStrategy, PreTokeni
 from ...utils import TensorType, logging
 from .vibepod_tokenizer_processor import AudioNormalizer
 
-import pdb
 
 logger = logging.get_logger(__name__)
 
@@ -141,111 +140,34 @@ class VibePodProcessor:
         
         logger.info(f"Processor configuration saved in {config_path}")
     
-    def __call__(
+    def process_podcast_script(
         self,
-        text: Optional[Union[str, List[str], TextInput, PreTokenizedInput, List[TextInput], List[PreTokenizedInput]]] = None,
-        voice_samples: Optional[Union[List[Union[str, np.ndarray]], List[List[Union[str, np.ndarray]]]]] = None,
-        padding: Union[bool, str, PaddingStrategy] = True,
-        truncation: Union[bool, str, TruncationStrategy] = False,
-        max_length: Optional[int] = None,
+        script: str,
+        speaker_samples: List[Union[str, np.ndarray]] = None,
         return_tensors: Optional[Union[str, TensorType]] = None,
-        return_attention_mask: bool = True,
         **kwargs,
     ) -> BatchEncoding:
         """
-        Main method to process one or more podcast scripts with optional voice samples.
+        Process a podcast script with speaker voice samples for TTS generation.
 
         Args:
-            text (`str`, `List[str]`):
-                The input text(s) to process. Can be:
-                - A single script string
-                - A list of script strings for batch processing
-                - A path to a .json or .txt file
-                - A list of paths
-            voice_samples (`List[Union[str, np.ndarray]]`, `List[List[Union[str, np.ndarray]]]`, *optional*):
-                Voice samples for each script. Can be:
-                - A list of samples for a single script
-                - A list of lists for batch processing
-            padding (`bool`, `str` or `PaddingStrategy`, defaults to `True`):
-                Whether to pad sequences to the same length
-            truncation (`bool`, `str` or `TruncationStrategy`, defaults to `False`):
-                Whether to truncate sequences
-            max_length (`int`, *optional*):
-                Maximum length of the returned sequences
-            return_tensors (`str` or `TensorType`, *optional*):
-                If set, will return tensors of a particular framework
-            return_attention_mask (`bool`, defaults to `True`):
-                Whether to return the attention mask
+            script (`str`):
+                The podcast script in format "Speaker 1: text\nSpeaker 2: text\n..."
+            speaker_samples (`List[Union[str, np.ndarray]]`, *optional*):
+                List of audio samples (file paths or arrays) for each speaker's voice.
+            return_tensors (`str` or [`~utils.TensorType`], *optional*):
+                If set, will return tensors of a particular framework. Acceptable values are:
+                - `'tf'`: Return TensorFlow `tf.constant` objects.
+                - `'pt'`: Return PyTorch `torch.Tensor` objects.
+                - `'np'`: Return NumPy `np.ndarray` objects.
 
         Returns:
-            `BatchEncoding`: A BatchEncoding with the following fields:
-                - **input_ids** -- List of token id sequences or tensor
-                - **attention_mask** -- List of attention masks or tensor
-                - **speech_tensors** -- Padded speech inputs (if voice_samples provided)
-                - **speech_masks** -- Speech masks (if voice_samples provided)
-                - **speech_input_mask** -- Boolean masks indicating speech token positions
+            [`BatchEncoding`]: A [`BatchEncoding`] with the following fields:
+                - **input_ids** -- Token IDs including special tokens for speech
+                - **speech_inputs** -- Processed audio tensors for voice samples
+                - **speech_input_mask** -- Boolean mask indicating speech token positions
+                - **parsed_script** -- List of (speaker_id, text) tuples
         """
-        # Handle single vs batch input
-        if isinstance(text, str) or (isinstance(text, list) and len(text) > 0 and not isinstance(text[0], str)):
-            # Single input
-            texts = [text]
-            is_batched = False
-        else:
-            # Batch input
-            texts = text
-            is_batched = True
-            
-        # Handle voice samples
-        if voice_samples is not None:
-            if not is_batched or (isinstance(voice_samples[0], (str, np.ndarray))):
-                # Single set of voice samples
-                voice_samples_list = [voice_samples]
-            else:
-                # Batch of voice samples
-                voice_samples_list = voice_samples
-        else:
-            voice_samples_list = [None] * len(texts)
-        
-        # pdb.set_trace()
-        # Process each input
-        all_encodings = []
-        for text_input, voice_input in zip(texts, voice_samples_list):
-            encoding = self._process_single(text_input, voice_input)
-            all_encodings.append(encoding)
-            
-        # Combine batch
-        batch_encoding = self._batch_encode(
-            all_encodings,
-            padding=padding,
-            truncation=truncation,
-            max_length=max_length,
-            return_tensors=return_tensors,
-            return_attention_mask=return_attention_mask,
-        )
-        
-        return batch_encoding
-    
-    def _process_single(
-        self,
-        text: Union[str, TextInput],
-        voice_samples: Optional[List[Union[str, np.ndarray]]] = None,
-    ) -> Dict[str, Any]:
-        """Process a single podcast script."""
-        # Determine if text is a file path or direct script
-        script = None
-        if isinstance(text, str):
-            # Check if it's a file path
-            if text.endswith('.json') and os.path.exists(text):
-                script = self._convert_json_to_script(text)
-            elif text.endswith('.txt') and os.path.exists(text):
-                script = self._convert_text_to_script(text)
-            else:
-                # Assume it's the script content directly
-                script = text
-        
-        if script is None:
-            raise ValueError(f"Could not process input text: {text}")
-        
         # Parse the script
         parsed_lines = self._parse_script(script)
         all_speakers = list(set(speaker_id for speaker_id, _ in parsed_lines))
@@ -254,8 +176,8 @@ class VibePodProcessor:
         system_tokens = self.tokenizer.encode(self.system_prompt, add_special_tokens=False)
         
         # Process voice samples if provided
-        if voice_samples:
-            voice_tokens, voice_speech_inputs, voice_speech_masks = self._create_voice_prompt(voice_samples[:len(all_speakers)])
+        if speaker_samples:
+            voice_tokens, voice_speech_inputs, voice_speech_masks = self._create_voice_prompt(speaker_samples[:len(all_speakers)])
         else:
             voice_tokens, voice_speech_inputs, voice_speech_masks = [], [], []
         
@@ -276,124 +198,33 @@ class VibePodProcessor:
         full_tokens += self.tokenizer.encode(' Speech output:\n', add_special_tokens=False) + [self.tokenizer.speech_start_id]
         speech_input_mask += [False] * (len(self.tokenizer.encode(' Speech output:\n', add_special_tokens=False)) + 1)
         
-        return {
-            "input_ids": full_tokens,
-            "speech_inputs": voice_speech_inputs if voice_speech_inputs else None,
-            "speech_input_mask": speech_input_mask,
-            "parsed_script": parsed_lines,
-            "all_speakers": all_speakers,
-        }
-    
-    def _batch_encode(
-        self,
-        encodings: List[Dict[str, Any]],
-        padding: Union[bool, str, PaddingStrategy] = True,
-        truncation: Union[bool, str, TruncationStrategy] = False,
-        max_length: Optional[int] = None,
-        return_tensors: Optional[Union[str, TensorType]] = None,
-        return_attention_mask: bool = True,
-    ) -> BatchEncoding:
-        """Combine multiple encodings into a batch with padding."""
-        # Extract input_ids and create attention_mask
-        input_ids_list = [enc["input_ids"] for enc in encodings]
-        speech_input_masks_list = [enc["speech_input_mask"] for enc in encodings]
+        # Prepare outputs
+        encoding = BatchEncoding()
+        encoding["input_ids"] = full_tokens
+        encoding["speech_inputs"] = voice_speech_inputs if voice_speech_inputs else None
+        encoding["speech_input_mask"] = speech_input_mask
+        encoding["parsed_script"] = parsed_lines
+        encoding["all_speakers"] = all_speakers
         
-        # Determine padding strategy
-        if isinstance(padding, bool):
-            padding_strategy = PaddingStrategy.LONGEST if padding else PaddingStrategy.DO_NOT_PAD
-        elif isinstance(padding, str):
-            padding_strategy = PaddingStrategy(padding)
-        else:
-            padding_strategy = padding
-            
-        # Apply padding to input_ids
-        if padding_strategy != PaddingStrategy.DO_NOT_PAD:
-            if padding_strategy == PaddingStrategy.LONGEST:
-                max_len = max(len(ids) for ids in input_ids_list)
-            elif padding_strategy == PaddingStrategy.MAX_LENGTH and max_length is not None:
-                max_len = max_length
-            else:
-                max_len = max(len(ids) for ids in input_ids_list)
-                
-            # Pad sequences
-            padded_input_ids = []
-            attention_masks = []
-            padded_speech_input_masks = []
-            
-            for input_ids, speech_mask in zip(input_ids_list, speech_input_masks_list):
-                # Truncate if needed
-                if truncation and len(input_ids) > max_len:
-                    input_ids = input_ids[:max_len]
-                    speech_mask = speech_mask[:max_len]
-                    
-                # Pad
-                padding_length = max_len - len(input_ids)
-                padded_ids = [self.tokenizer.pad_token_id] * padding_length + input_ids
-                attention_mask = [0] * padding_length + [1] * len(input_ids)
-                padded_speech_mask = [False] * padding_length + speech_mask
-                
-                padded_input_ids.append(padded_ids)
-                attention_masks.append(attention_mask)
-                padded_speech_input_masks.append(padded_speech_mask)
-                
-            input_ids_list = padded_input_ids
-            speech_input_masks_list = padded_speech_input_masks
-        else:
-            # No padding, just create attention masks
-            attention_masks = [[1] * len(ids) for ids in input_ids_list] if return_attention_mask else None
-            
-        # Process speech inputs
-        all_speech_inputs = []
-        has_speech = False
-        for enc in encodings:
-            if enc["speech_inputs"] is not None:
-                all_speech_inputs.extend(enc["speech_inputs"])
-                has_speech = True
-                
-        # Prepare batch encoding
-        batch_encoding = BatchEncoding()
-        
-        # Handle tensor conversion
+        # Convert to tensors if requested
         if return_tensors is not None:
+            # Handle tensor conversion manually for complex types
             if return_tensors == "pt":
-                batch_encoding["input_ids"] = torch.tensor(input_ids_list, dtype=torch.long)
-                if return_attention_mask and attention_masks is not None:
-                    batch_encoding["attention_mask"] = torch.tensor(attention_masks, dtype=torch.long)
-                batch_encoding["speech_input_mask"] = torch.tensor(speech_input_masks_list, dtype=torch.bool)
+                encoding["input_ids"] = torch.tensor(encoding["input_ids"])
+                encoding["speech_input_mask"] = torch.tensor(encoding["speech_input_mask"], dtype=torch.bool)
+                # Don't convert speech_inputs here - they need padding first
             elif return_tensors == "np":
-                batch_encoding["input_ids"] = np.array(input_ids_list, dtype=np.int64)
-                if return_attention_mask and attention_masks is not None:
-                    batch_encoding["attention_mask"] = np.array(attention_masks, dtype=np.int64)
-                batch_encoding["speech_input_mask"] = np.array(speech_input_masks_list, dtype=np.bool_)
+                encoding["input_ids"] = np.array(encoding["input_ids"])
+                encoding["speech_input_mask"] = np.array(encoding["speech_input_mask"], dtype=np.bool_)
             elif return_tensors == "tf":
                 import tensorflow as tf
-                batch_encoding["input_ids"] = tf.constant(input_ids_list, dtype=tf.int64)
-                if return_attention_mask and attention_masks is not None:
-                    batch_encoding["attention_mask"] = tf.constant(attention_masks, dtype=tf.int64)
-                batch_encoding["speech_input_mask"] = tf.constant(speech_input_masks_list, dtype=tf.bool)
-        else:
-            batch_encoding["input_ids"] = input_ids_list
-            if return_attention_mask and attention_masks is not None:
-                batch_encoding["attention_mask"] = attention_masks
-            batch_encoding["speech_input_mask"] = speech_input_masks_list
+                encoding["input_ids"] = tf.constant(encoding["input_ids"])
+                encoding["speech_input_mask"] = tf.constant(encoding["speech_input_mask"], dtype=tf.bool)
+            else:
+                # For other fields that can be converted normally
+                encoding = encoding.convert_to_tensors(return_tensors, prepend_batch_axis=False)
             
-        # Process speech tensors if present
-        if has_speech:
-            speech_dict = self.prepare_speech_inputs(
-                all_speech_inputs,
-                return_tensors=return_tensors,
-            )
-            batch_encoding["speech_tensors"] = speech_dict["padded_speeches"]
-            batch_encoding["speech_masks"] = speech_dict["speech_masks"]
-        else:
-            batch_encoding["speech_tensors"] = None
-            batch_encoding["speech_masks"] = None
-            
-        # Add metadata
-        batch_encoding["parsed_scripts"] = [enc["parsed_script"] for enc in encodings]
-        batch_encoding["all_speakers_list"] = [enc["all_speakers"] for enc in encodings]
-        
-        return batch_encoding
+        return encoding
 
     def _create_voice_prompt(
         self, 
@@ -488,14 +319,83 @@ class VibePodProcessor:
         
         # Convert to tensors if requested
         if return_tensors == "pt":
-            result["padded_speeches"] = torch.tensor(padded_speeches, device=device, dtype=dtype or torch.float32)
-            result["speech_masks"] = torch.tensor(speech_masks, device=device, dtype=torch.bool)
+            result["padded_speeches"] = torch.tensor(padded_speeches, device=device, dtype=dtype)
+            result["speech_masks"] = torch.tensor(speech_masks, device=device)
         elif return_tensors == "tf":
             import tensorflow as tf
             result["padded_speeches"] = tf.constant(padded_speeches, dtype=tf.float32)
             result["speech_masks"] = tf.constant(speech_masks, dtype=tf.bool)
             
         return result
+
+    def __call__(
+        self,
+        text: Optional[Union[str, TextInput, PreTokenizedInput, List[TextInput], List[PreTokenizedInput]]] = None,
+        voice_samples: Optional[List[Union[str, np.ndarray]]] = None,
+        return_tensors: Optional[Union[str, TensorType]] = None,
+        device: Optional[Union[str, torch.device]] = None,
+        dtype: Optional[torch.dtype] = None,
+        prepare_for_generation: bool = False,
+        **kwargs,
+    ) -> BatchEncoding:
+        
+        # Determine if text is a file path or direct script
+        script = None
+        if isinstance(text, str):
+            # Check if it's a file path
+            if text.endswith('.json') and os.path.exists(text):
+                script = self._convert_json_to_script(text)
+            elif text.endswith('.txt') and os.path.exists(text):
+                script = self._convert_text_to_script(text)
+            else:
+                # Assume it's the script content directly
+                script = text
+        
+        if script is None:
+            raise ValueError(f"Could not process input text: {text}")
+        
+        # Process podcast script
+        encoding = self.process_podcast_script(
+            script=script,
+            speaker_samples=voice_samples,
+            return_tensors=return_tensors,
+            **kwargs
+        )
+        
+        # Prepare speech inputs if needed
+        if encoding["speech_inputs"] is not None:
+            speech_dict = self.prepare_speech_inputs(
+                encoding["speech_inputs"],
+                return_tensors=return_tensors,
+                device=device,
+                dtype=dtype,
+            )
+            encoding["speech_tensors"] = speech_dict["padded_speeches"]
+            encoding["speech_masks"] = speech_dict["speech_masks"]
+        else:
+            encoding["speech_tensors"] = None
+            encoding["speech_masks"] = None
+        
+        # Move to device if specified
+        if device is not None and return_tensors == "pt":
+            for key in ["input_ids", "speech_input_mask", "speech_tensors", "speech_masks"]:
+                if key in encoding and encoding[key] is not None:
+                    if isinstance(encoding[key], torch.Tensor):
+                        encoding[key] = encoding[key].to(device)
+        
+        # Prepare for generation if requested
+        if prepare_for_generation:
+            if "input_ids" in encoding:
+                encoding["prompt_ids"] = encoding["input_ids"][:-1]
+                encoding["last_ids"] = encoding["input_ids"][-1].unsqueeze(0)
+                # Remove original input_ids to avoid confusion
+                del encoding["input_ids"]
+                
+                # Also adjust speech_input_mask
+                if "speech_input_mask" in encoding:
+                    encoding["speech_input_mask"] = encoding["speech_input_mask"][:-1]
+        
+        return encoding
         
     def _convert_json_to_script(self, json_file: str) -> str:
         """
