@@ -212,7 +212,16 @@ class VibePodTokenizerStreamingCache:
         for i, idx in enumerate(sample_indices.tolist()):
             key = (layer_id, idx)
             self.cache[key] = states[i].detach()
-    
+
+    def set_to_zero(self, sample_indices: torch.Tensor):
+        """Set all cached states to zero for given sample indices"""
+        for key in list(self.cache.keys()):
+            layer_id, sample_idx = key
+            if sample_idx in sample_indices.tolist():
+                # Create zero tensor with same shape and dtype as cached tensor
+                cached_tensor = self.cache[key]
+                self.cache[key] = torch.zeros_like(cached_tensor)
+                
     def clear(self, layer_id: Optional[str] = None, sample_indices: Optional[torch.Tensor] = None):
         """Clear cache for specific layer/samples or everything"""
         if layer_id is None and sample_indices is None:

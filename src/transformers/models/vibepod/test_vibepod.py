@@ -265,13 +265,17 @@ def main():
     # if all_tests or args.test_padding:
     #     test_padding_strategies(processor, scripts)
 
-    model.generate(
+    outputs = model.generate(
         **inputs,
         max_new_tokens=100,
         cfg_scale=1.5,
         tokenizer=processor.tokenizer,
     )
     
+    processor.save_audio(
+        outputs.speech_outputs,
+        output_path="./vibepod_outputs",
+    )
     # Always test edge cases
     # test_edge_cases(processor)
     
