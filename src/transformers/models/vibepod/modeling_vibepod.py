@@ -395,7 +395,7 @@ class VibePodForConditionalGeneration(VibePodPreTrainedModel, GenerationMixin):
         return generation_config, model_kwargs, input_ids
 
     @torch.no_grad()
-    def generate(
+    def generate_negative_with_start_end_token(
         self,
         inputs: Optional[torch.Tensor] = None,
         generation_config: Optional[GenerationConfig] = None,
@@ -435,11 +435,13 @@ class VibePodForConditionalGeneration(VibePodPreTrainedModel, GenerationMixin):
         tokenizer = kwargs.pop("tokenizer", None)  # Pull this out first, we only use it for stopping criteria
         parsed_scripts = kwargs.pop("parsed_scripts", None)
         all_speakers_list = kwargs.pop("all_speakers_list", None)
+        if kwargs.get('max_new_tokens', None) is None:
+            kwargs['max_new_tokens'] = self.config.decoder_config.max_position_embeddings - kwargs['input_ids'].shape[-1]
 
         generation_config, model_kwargs, input_ids = self._build_generate_config_model_kwargs(
             inputs, tokenizer, **kwargs
         )
-        pdb.set_trace()
+        
         negative_kwargs = {
             'input_ids': torch.full((kwargs['input_ids'].shape[0], 1), tokenizer.speech_start_id, dtype=torch.long, device=kwargs['input_ids'].device),
             'attention_mask':  torch.ones((kwargs['input_ids'].shape[0], 1), dtype=torch.long, device=kwargs['input_ids'].device),
@@ -465,6 +467,9 @@ class VibePodForConditionalGeneration(VibePodPreTrainedModel, GenerationMixin):
         audio_chunks = [[] for _ in range(batch_size)]
 
         while (~finished_tags).any():
+            if input_ids.shape[-1] >= generation_config.max_length:
+                print(f"Reached maximum generation length {generation_config.max_length}, stopping early.")
+                break
             model_inputs = self.prepare_inputs_for_generation(input_ids, **model_kwargs)
             if is_prefill:
                 # we process the speech inputs only during the first generation step
@@ -501,11 +506,12 @@ class VibePodForConditionalGeneration(VibePodPreTrainedModel, GenerationMixin):
             # reached end of generation
             if generation_config.eos_token_id is not None and (next_tokens == generation_config.eos_token_id).any():
                 eos_indices = (next_tokens == generation_config.eos_token_id).nonzero(as_tuple=False).squeeze(1)
-                print(f"Reached EOS at indices: {eos_indices.tolist()}")
-                if eos_indices.numel() > 0:
-                    finished_tags[eos_indices] = True
+                # Only print for samples that are newly finished (not already marked as finished)
+                new_eos_indices = eos_indices[~finished_tags[eos_indices]]
+                if new_eos_indices.numel() > 0:
+                    print(f"Reached EOS at indices: {new_eos_indices.tolist()}")
+                    finished_tags[new_eos_indices] = True
                     
-
             # speech_end
             diffusion_end_indices = (next_tokens == generation_config.speech_end_id).nonzero(as_tuple=False).squeeze(1)
             if diffusion_end_indices.numel() > 0:
@@ -517,6 +523,227 @@ class VibePodForConditionalGeneration(VibePodPreTrainedModel, GenerationMixin):
             diffusion_start_indices = (next_tokens == generation_config.speech_start_id).nonzero(as_tuple=False).squeeze(1)
             if diffusion_start_indices.numel() > 0:
                 # No special handling needed for start tokens
+                # pdb.set_trace()
+                # maybe clear the negative cache here? 
+                pass
+            
+            # Prepare inputs_embeds for next iteration
+            # Initialize with default embeddings for all tokens
+            next_inputs_embeds = self.model.get_input_embeddings()(next_tokens).unsqueeze(1)  # [batch_size, 1, hidden_size]
+            
+
+            # forward diffusion
+            diffusion_indices = (next_tokens == generation_config.speech_diffusion_id).nonzero(as_tuple=False).squeeze(1)
+            if diffusion_indices.numel() > 0:
+                # pdb.set_trace()
+                negative_model_inputs = self.prepare_inputs_for_generation(negative_input_ids, **negative_model_kwargs)
+                # Forward negative pass through the model
+                if negative_model_inputs['inputs_embeds'] is None and inputs_embeds is not None:
+                    negative_model_inputs['inputs_embeds'] = inputs_embeds
+                    negative_model_inputs['input_ids'] = None
+
+                negative_outputs = self(
+                    **negative_model_inputs, logits_to_keep=0, return_dict=True, output_attentions=False, output_hidden_states=False,
+                )
+                negative_model_kwargs = self._update_model_kwargs_for_generation(
+                    negative_outputs, negative_model_kwargs, is_encoder_decoder=False,
+                )
+                negative_input_ids = torch.cat([negative_input_ids, next_tokens[:, None]], dim=-1)
+
+                positive_condition = outputs.last_hidden_state[diffusion_indices, -1, :]
+                negative_condition = negative_outputs.last_hidden_state[diffusion_indices, -1, :]
+                
+                speech_latent = self.sample_speech_tokens(
+                    positive_condition,
+                    negative_condition,
+                    cfg_scale=cfg_scale,
+                ).unsqueeze(1)
+                                
+                # Decode acoustic latent to audio using acoustic streaming cache
+                scaled_latent = speech_latent / self.model.speech_scaling_factor - self.model.speech_bias_factor
+                audio_chunk = self.model.acoustic_tokenizer.decode(
+                    scaled_latent,
+                    cache=acoustic_cache,  # Use acoustic-specific cache
+                    sample_indices=diffusion_indices,
+                    use_cache=True,
+                    debug=False
+                )
+                
+                # Store audio chunks for each sample
+                for i, sample_idx in enumerate(diffusion_indices):
+                    idx = sample_idx.item()
+                    # Only append audio chunk if the sample is not finished
+                    if not finished_tags[idx]:
+                        audio_chunks[idx].append(audio_chunk[i])
+
+                # Encode audio to semantic features using semantic streaming cache
+                semantic_features = self.model.semantic_tokenizer.encode(
+                    audio_chunk,
+                    cache=semantic_cache,  # Use semantic-specific cache
+                    sample_indices=diffusion_indices,
+                    use_cache=True,
+                    debug=False
+                ).mean
+                
+                # Combine acoustic and semantic features for next input
+                acoustic_embed = self.model.acoustic_connector(speech_latent)
+                semantic_embed = self.model.semantic_connector(semantic_features)
+                diffusion_embeds = acoustic_embed + semantic_embed
+
+                # Update embeddings for diffusion indices
+                next_inputs_embeds[diffusion_indices] = diffusion_embeds
+            
+            # Set inputs_embeds for next iteration
+            inputs_embeds = next_inputs_embeds
+            
+        # Concatenate audio chunks for each sample
+        final_audio_outputs = []
+        for sample_chunks in audio_chunks:
+            if sample_chunks:
+                # Concatenate all chunks along the time dimension (assumed to be the last dimension)
+                concatenated_audio = torch.cat(sample_chunks, dim=-1)
+                final_audio_outputs.append(concatenated_audio)
+            else:
+                # If no audio was generated for this sample, append None
+                final_audio_outputs.append(None)
+
+        # pdb.set_trace()
+        return VibePodGenerationOutput(
+            sequences=input_ids,
+            speech_outputs=final_audio_outputs if return_speech else None
+        )
+    
+    @torch.no_grad()
+    def generate_negative_without_start_end_token(
+        self,
+        inputs: Optional[torch.Tensor] = None,
+        generation_config: Optional[GenerationConfig] = None,
+        logits_processor: Optional[LogitsProcessorList] = None,
+        stopping_criteria: Optional[StoppingCriteriaList] = None,
+        prefix_allowed_tokens_fn: Optional[Callable[[int, torch.Tensor], List[int]]] = None,
+        synced_gpus: Optional[bool] = None,
+        assistant_model: Optional["PreTrainedModel"] = None,
+        streamer: Optional["BaseStreamer"] = None,
+        negative_prompt_ids: Optional[torch.Tensor] = None,
+        negative_prompt_attention_mask: Optional[torch.Tensor] = None,
+        speech_tensors: Optional[torch.FloatTensor] = None,
+        speech_masks: Optional[torch.BoolTensor] = None,
+        speech_input_mask: Optional[torch.BoolTensor] = None,
+        return_speech: bool = True,
+        cfg_scale: float = 1.0,
+        do_sample: bool = False,
+        **kwargs,
+    ) -> Union[torch.LongTensor, VibePodGenerationOutput]:
+        """
+        Generates sequences of token ids and optionally speech outputs.
+        
+        Args:
+            All standard generation arguments from GenerationMixin
+            negative_prompt_ids: Negative prompt for CFG in speech generation
+            negative_prompt_attention_mask: Attention mask for negative prompt
+            speech_tensors: Input speech for voice cloning
+            speech_masks: Masks for speech tensors  
+            speech_input_mask: Positions to insert speech embeddings
+            return_speech: Whether to decode and return speech outputs
+            cfg_scale: CFG scale for speech generation
+ 
+        Returns:
+            Generated token sequences and optionally speech outputs
+        """
+        # 1. Handle `generation_config` and kwargs that might update it, and validate the `.generate()` call
+        tokenizer = kwargs.pop("tokenizer", None)  # Pull this out first, we only use it for stopping criteria
+        parsed_scripts = kwargs.pop("parsed_scripts", None)
+        all_speakers_list = kwargs.pop("all_speakers_list", None)
+        if kwargs.get('max_new_tokens', None) is None:
+            kwargs['max_new_tokens'] = self.config.decoder_config.max_position_embeddings - kwargs['input_ids'].shape[-1]
+
+        generation_config, model_kwargs, input_ids = self._build_generate_config_model_kwargs(
+            inputs, tokenizer, **kwargs
+        )
+        
+        negative_kwargs = {
+            'input_ids': torch.full((kwargs['input_ids'].shape[0], 1), tokenizer.speech_start_id, dtype=torch.long, device=kwargs['input_ids'].device),
+            'attention_mask':  torch.ones((kwargs['input_ids'].shape[0], 1), dtype=torch.long, device=kwargs['input_ids'].device),
+            'max_new_tokens': kwargs.get('max_new_tokens', 100) 
+        }
+        negative_generation_config, negative_model_kwargs, negative_input_ids = self._build_generate_config_model_kwargs(
+            None, tokenizer, **negative_kwargs
+        )
+
+        logits_processor = LogitsProcessorList()
+
+        acoustic_cache = VibePodTokenizerStreamingCache()
+        semantic_cache = VibePodTokenizerStreamingCache()
+        
+        batch_size = input_ids.shape[0]
+        device = input_ids.device
+        finished_tags = torch.zeros(batch_size, dtype=torch.bool, device=device)
+        correct_cnt = torch.zeros(batch_size, dtype=torch.long, device=device)
+        is_prefill = True
+        inputs_embeds = None
+
+        # Initialize audio chunks storage for each sample
+        audio_chunks = [[] for _ in range(batch_size)]
+
+        while (~finished_tags).any():
+            if input_ids.shape[-1] >= generation_config.max_length:
+                print(f"Reached maximum generation length {generation_config.max_length}, stopping early.")
+                break
+            model_inputs = self.prepare_inputs_for_generation(input_ids, **model_kwargs)
+            if is_prefill:
+                # we process the speech inputs only during the first generation step
+                prefill_inputs = {
+                    "speech_tensors": speech_tensors.to(device=device),
+                    "speech_masks": speech_masks.to(device),
+                    "speech_input_mask": speech_input_mask.to(device),
+                }
+                is_prefill = False
+            else:
+                _ = model_inputs.pop('inputs_embeds', None)
+                prefill_inputs = {'inputs_embeds': inputs_embeds}
+            # Forward pass through the model
+            outputs = self(
+                **model_inputs, **prefill_inputs, logits_to_keep=1, return_dict=True, output_attentions=False, output_hidden_states=False,
+            )
+            model_kwargs = self._update_model_kwargs_for_generation(
+                outputs, model_kwargs, is_encoder_decoder=False,
+            )
+
+            # Get logits and apply logits processor
+            next_token_logits = outputs.logits[:, -1, :].to(copy=True, dtype=torch.float32, device=input_ids.device)
+            next_token_scores = logits_processor(input_ids, next_token_logits)
+            # token selection
+            if do_sample:
+                probs = nn.functional.softmax(next_token_scores, dim=-1)
+                # TODO (joao): this OP throws "skipping cudagraphs due to ['incompatible ops']", find solution
+                next_tokens = torch.multinomial(probs, num_samples=1).squeeze(1)
+            else:
+                next_tokens = torch.argmax(next_token_scores, dim=-1)
+
+            input_ids = torch.cat([input_ids, next_tokens[:, None]], dim=-1)
+            
+            # reached end of generation
+            if generation_config.eos_token_id is not None and (next_tokens == generation_config.eos_token_id).any():
+                eos_indices = (next_tokens == generation_config.eos_token_id).nonzero(as_tuple=False).squeeze(1)
+                # Only print for samples that are newly finished (not already marked as finished)
+                new_eos_indices = eos_indices[~finished_tags[eos_indices]]
+                if new_eos_indices.numel() > 0:
+                    print(f"Reached EOS at indices: {new_eos_indices.tolist()}")
+                    finished_tags[new_eos_indices] = True
+                    
+            # speech_end
+            diffusion_end_indices = (next_tokens == generation_config.speech_end_id).nonzero(as_tuple=False).squeeze(1)
+            if diffusion_end_indices.numel() > 0:
+                # Clear tokenizer caches for samples that reached speech end
+                acoustic_cache.set_to_zero(diffusion_end_indices)
+                semantic_cache.set_to_zero(diffusion_end_indices)
+            
+            # speech_begin
+            diffusion_start_indices = (next_tokens == generation_config.speech_start_id).nonzero(as_tuple=False).squeeze(1)
+            if diffusion_start_indices.numel() > 0:
+                # No special handling needed for start tokens
+                # pdb.set_trace()
+                # maybe clear the negative cache here? 
                 pass
             
             # Prepare inputs_embeds for next iteration
@@ -542,25 +769,14 @@ class VibePodForConditionalGeneration(VibePodPreTrainedModel, GenerationMixin):
                 negative_input_ids = torch.cat([negative_input_ids, next_tokens[:, None]], dim=-1)
 
                 # correct the non-diffusion indices
+                # we forward add samples' negative outputs even if 
+                #   they are not in diffusion mode to keep the cache consistent
+                # So we need to correct the kv cache of non-diffusion samples
                 if diffusion_indices.numel() < batch_size - finished_tags.sum():
-                    # pdb.set_trace()
                     # not all samples are in diffusion mode, but we calculate all negative outputs
                     non_diffusion_indices = torch.arange(batch_size, device=device)[~finished_tags & (next_tokens != generation_config.speech_diffusion_id)]
                     start_indices = correct_cnt[non_diffusion_indices]
-                    print(f"Non-diffusion indices: {non_diffusion_indices}, Start indices: {start_indices}")
-                    # # 1. attention_mask
-                    # negative_model_kwargs['attention_mask'][non_diffusion_indices, start_index+1:] = negative_model_kwargs['attention_mask'][non_diffusion_indices, start_index:-1]
-                    # negative_model_kwargs['attention_mask'][non_diffusion_indices, 0] = 0
-                    # # 2. past_key_values
-                    # for k_cache, v_cache in zip(negative_model_kwargs['past_key_values'].key_cache, 
-                    #                             negative_model_kwargs['past_key_values'].value_cache):
-                    #     # k_cache[non_diffusion_indices, :, 1:, :] = k_cache[non_diffusion_indices, :, :-1, :]
-                    #     # v_cache[non_diffusion_indices, :, 1:, :] = v_cache[non_diffusion_indices, :, :-1, :]
-                    #     k_cache[non_diffusion_indices, :, start_index+1:, :] = k_cache[non_diffusion_indices, :, start_index:-1, :]
-                    #     v_cache[non_diffusion_indices, :, start_index+1:, :] = v_cache[non_diffusion_indices, :, start_index:-1, :]
-                    # # 3. negative_input_ids
-                    # # negative_input_ids[non_diffusion_indices, 1:] = negative_input_ids[non_diffusion_indices, :-1]
-                    # negative_input_ids[non_diffusion_indices, start_index+1:] = negative_input_ids[non_diffusion_indices, start_index:-1]
+                    print(f"Non-diffusion indices: {non_diffusion_indices.tolist()}, Start indices: {start_indices.tolist()}")
 
                     # 1. Update attention_mask - need to handle each sample separately
                     seq_len = negative_model_kwargs['attention_mask'].shape[1]
@@ -610,7 +826,281 @@ class VibePodForConditionalGeneration(VibePodPreTrainedModel, GenerationMixin):
                 
                 # Store audio chunks for each sample
                 for i, sample_idx in enumerate(diffusion_indices):
-                    audio_chunks[sample_idx.item()].append(audio_chunk[i])
+                    idx = sample_idx.item()
+                    # Only append audio chunk if the sample is not finished
+                    if not finished_tags[idx]:
+                        audio_chunks[idx].append(audio_chunk[i])
+
+                # Encode audio to semantic features using semantic streaming cache
+                semantic_features = self.model.semantic_tokenizer.encode(
+                    audio_chunk,
+                    cache=semantic_cache,  # Use semantic-specific cache
+                    sample_indices=diffusion_indices,
+                    use_cache=True,
+                    debug=False
+                ).mean
+                
+                # Combine acoustic and semantic features for next input
+                acoustic_embed = self.model.acoustic_connector(speech_latent)
+                semantic_embed = self.model.semantic_connector(semantic_features)
+                diffusion_embeds = acoustic_embed + semantic_embed
+
+                # Update embeddings for diffusion indices
+                next_inputs_embeds[diffusion_indices] = diffusion_embeds
+            
+            # Set inputs_embeds for next iteration
+            inputs_embeds = next_inputs_embeds
+            
+        # Concatenate audio chunks for each sample
+        final_audio_outputs = []
+        for sample_chunks in audio_chunks:
+            if sample_chunks:
+                # Concatenate all chunks along the time dimension (assumed to be the last dimension)
+                concatenated_audio = torch.cat(sample_chunks, dim=-1)
+                final_audio_outputs.append(concatenated_audio)
+            else:
+                # If no audio was generated for this sample, append None
+                final_audio_outputs.append(None)
+
+        # pdb.set_trace()
+        return VibePodGenerationOutput(
+            sequences=input_ids,
+            speech_outputs=final_audio_outputs if return_speech else None
+        )
+    
+    @torch.no_grad()
+    def generate(
+        self,
+        inputs: Optional[torch.Tensor] = None,
+        generation_config: Optional[GenerationConfig] = None,
+        logits_processor: Optional[LogitsProcessorList] = None,
+        stopping_criteria: Optional[StoppingCriteriaList] = None,
+        prefix_allowed_tokens_fn: Optional[Callable[[int, torch.Tensor], List[int]]] = None,
+        synced_gpus: Optional[bool] = None,
+        assistant_model: Optional["PreTrainedModel"] = None,
+        streamer: Optional["BaseStreamer"] = None,
+        negative_prompt_ids: Optional[torch.Tensor] = None,
+        negative_prompt_attention_mask: Optional[torch.Tensor] = None,
+        speech_tensors: Optional[torch.FloatTensor] = None,
+        speech_masks: Optional[torch.BoolTensor] = None,
+        speech_input_mask: Optional[torch.BoolTensor] = None,
+        return_speech: bool = True,
+        cfg_scale: float = 1.0,
+        do_sample: bool = False,
+        **kwargs,
+    ) -> Union[torch.LongTensor, VibePodGenerationOutput]:
+        """
+        Generates sequences of token ids and optionally speech outputs.
+        
+        Args:
+            All standard generation arguments from GenerationMixin
+            negative_prompt_ids: Negative prompt for CFG in speech generation
+            negative_prompt_attention_mask: Attention mask for negative prompt
+            speech_tensors: Input speech for voice cloning
+            speech_masks: Masks for speech tensors  
+            speech_input_mask: Positions to insert speech embeddings
+            return_speech: Whether to decode and return speech outputs
+            cfg_scale: CFG scale for speech generation
+ 
+        Returns:
+            Generated token sequences and optionally speech outputs
+        """
+        # 1. Handle `generation_config` and kwargs that might update it, and validate the `.generate()` call
+        tokenizer = kwargs.pop("tokenizer", None)  # Pull this out first, we only use it for stopping criteria
+        parsed_scripts = kwargs.pop("parsed_scripts", None)
+        all_speakers_list = kwargs.pop("all_speakers_list", None)
+        if kwargs.get('max_new_tokens', None) is None:
+            kwargs['max_new_tokens'] = self.config.decoder_config.max_position_embeddings - kwargs['input_ids'].shape[-1]
+
+        generation_config, model_kwargs, input_ids = self._build_generate_config_model_kwargs(
+            inputs, tokenizer, **kwargs
+        )
+        
+        negative_kwargs = {
+            'input_ids': torch.full((kwargs['input_ids'].shape[0], 1), tokenizer.speech_start_id, dtype=torch.long, device=kwargs['input_ids'].device),
+            'attention_mask':  torch.ones((kwargs['input_ids'].shape[0], 1), dtype=torch.long, device=kwargs['input_ids'].device),
+            'max_new_tokens': kwargs.get('max_new_tokens', 100) 
+        }
+        negative_generation_config, negative_model_kwargs, negative_input_ids = self._build_generate_config_model_kwargs(
+            None, tokenizer, **negative_kwargs
+        )
+
+        logits_processor = LogitsProcessorList()
+
+        acoustic_cache = VibePodTokenizerStreamingCache()
+        semantic_cache = VibePodTokenizerStreamingCache()
+        
+        batch_size = input_ids.shape[0]
+        device = input_ids.device
+        finished_tags = torch.zeros(batch_size, dtype=torch.bool, device=device)
+        correct_cnt = torch.zeros(batch_size, dtype=torch.long, device=device)
+        is_prefill = True
+        inputs_embeds = None
+
+        # Initialize audio chunks storage for each sample
+        audio_chunks = [[] for _ in range(batch_size)]
+
+        while (~finished_tags).any():
+            if input_ids.shape[-1] >= generation_config.max_length:
+                print(f"Reached maximum generation length {generation_config.max_length}, stopping early.")
+                break
+            model_inputs = self.prepare_inputs_for_generation(input_ids, **model_kwargs)
+            if is_prefill:
+                # we process the speech inputs only during the first generation step
+                prefill_inputs = {
+                    "speech_tensors": speech_tensors.to(device=device),
+                    "speech_masks": speech_masks.to(device),
+                    "speech_input_mask": speech_input_mask.to(device),
+                }
+                is_prefill = False
+            else:
+                _ = model_inputs.pop('inputs_embeds', None)
+                prefill_inputs = {'inputs_embeds': inputs_embeds}
+            # Forward pass through the model
+            outputs = self(
+                **model_inputs, **prefill_inputs, logits_to_keep=1, return_dict=True, output_attentions=False, output_hidden_states=False,
+            )
+            model_kwargs = self._update_model_kwargs_for_generation(
+                outputs, model_kwargs, is_encoder_decoder=False,
+            )
+
+            # Get logits and apply logits processor
+            next_token_logits = outputs.logits[:, -1, :].to(copy=True, dtype=torch.float32, device=input_ids.device)
+            next_token_scores = logits_processor(input_ids, next_token_logits)
+            # token selection
+            if do_sample:
+                probs = nn.functional.softmax(next_token_scores, dim=-1)
+                # TODO (joao): this OP throws "skipping cudagraphs due to ['incompatible ops']", find solution
+                next_tokens = torch.multinomial(probs, num_samples=1).squeeze(1)
+            else:
+                next_tokens = torch.argmax(next_token_scores, dim=-1)
+
+            input_ids = torch.cat([input_ids, next_tokens[:, None]], dim=-1)
+            
+            # reached end of generation
+            if generation_config.eos_token_id is not None and (next_tokens == generation_config.eos_token_id).any():
+                eos_indices = (next_tokens == generation_config.eos_token_id).nonzero(as_tuple=False).squeeze(1)
+                # Only print for samples that are newly finished (not already marked as finished)
+                new_eos_indices = eos_indices[~finished_tags[eos_indices]]
+                if new_eos_indices.numel() > 0:
+                    print(f"Reached EOS at indices: {new_eos_indices.tolist()}")
+                    finished_tags[new_eos_indices] = True
+                    
+            # speech_end
+            diffusion_end_indices = (next_tokens == generation_config.speech_end_id).nonzero(as_tuple=False).squeeze(1)
+            if diffusion_end_indices.numel() > 0:
+                # Clear tokenizer caches for samples that reached speech end
+                acoustic_cache.set_to_zero(diffusion_end_indices)
+                semantic_cache.set_to_zero(diffusion_end_indices)
+            
+            # speech_begin
+            diffusion_start_indices = (next_tokens == generation_config.speech_start_id).nonzero(as_tuple=False).squeeze(1)
+            if diffusion_start_indices.numel() > 0:
+                # No special handling needed for start tokens
+                # pdb.set_trace()
+                # maybe clear the negative cache here? 
+                pass
+            
+            # Prepare inputs_embeds for next iteration
+            # Initialize with default embeddings for all tokens
+            next_inputs_embeds = self.model.get_input_embeddings()(next_tokens).unsqueeze(1)  # [batch_size, 1, hidden_size]
+            
+            # # pdb.set_trace()
+            # negative_model_inputs = self.prepare_inputs_for_generation(negative_input_ids, **negative_model_kwargs)
+            # # Forward negative pass through the model
+            # if negative_model_inputs['inputs_embeds'] is None and inputs_embeds is not None:
+            #     negative_model_inputs['inputs_embeds'] = inputs_embeds
+            #     negative_model_inputs['input_ids'] = None
+
+            # negative_outputs = self(
+            #     **negative_model_inputs, logits_to_keep=0, return_dict=True, output_attentions=False, output_hidden_states=False,
+            # )
+            # negative_model_kwargs = self._update_model_kwargs_for_generation(
+            #     negative_outputs, negative_model_kwargs, is_encoder_decoder=False,
+            # )
+            # negative_input_ids = torch.cat([negative_input_ids, next_tokens[:, None]], dim=-1)
+            
+            # forward diffusion
+            diffusion_indices = (next_tokens == generation_config.speech_diffusion_id).nonzero(as_tuple=False).squeeze(1)
+            if diffusion_indices.numel() > 0:
+                # pdb.set_trace()
+                negative_model_inputs = self.prepare_inputs_for_generation(negative_input_ids, **negative_model_kwargs)
+                # Forward negative pass through the model
+                if negative_model_inputs['inputs_embeds'] is None and inputs_embeds is not None:
+                    negative_model_inputs['inputs_embeds'] = inputs_embeds
+                    negative_model_inputs['input_ids'] = None
+
+                negative_outputs = self(
+                    **negative_model_inputs, logits_to_keep=0, return_dict=True, output_attentions=False, output_hidden_states=False,
+                )
+                negative_model_kwargs = self._update_model_kwargs_for_generation(
+                    negative_outputs, negative_model_kwargs, is_encoder_decoder=False,
+                )
+                negative_input_ids = torch.cat([negative_input_ids, next_tokens[:, None]], dim=-1)
+
+                # correct the non-diffusion indices
+                # we forward add samples' negative outputs even if 
+                #   they are not in diffusion mode to keep the cache consistent
+                # So we need to correct the kv cache of non-diffusion samples
+                # if diffusion_indices.numel() < batch_size - finished_tags.sum():
+                #     pdb.set_trace()
+                #     # not all samples are in diffusion mode, but we calculate all negative outputs
+                #     non_diffusion_indices = torch.arange(batch_size, device=device)[~finished_tags & (next_tokens != generation_config.speech_diffusion_id)]
+                #     start_indices = correct_cnt[non_diffusion_indices]
+                #     print(f"Non-diffusion indices: {non_diffusion_indices.tolist()}, Start indices: {start_indices.tolist()}")
+
+                #     # 1. Update attention_mask - need to handle each sample separately
+                #     seq_len = negative_model_kwargs['attention_mask'].shape[1]
+                #     for i, (sample_idx, start_idx) in enumerate(zip(non_diffusion_indices.tolist(), start_indices.tolist())):
+                #         # Shift the attention mask for this sample
+                #         if start_idx + 1 < seq_len - 1:
+                #             negative_model_kwargs['attention_mask'][sample_idx, start_idx+1:] = \
+                #                 negative_model_kwargs['attention_mask'][sample_idx, start_idx:-1].clone()
+                #         negative_model_kwargs['attention_mask'][sample_idx, start_idx] = 0
+
+                #     # 2. Update past_key_values
+                #     for layer_idx, (k_cache, v_cache) in enumerate(zip(negative_model_kwargs['past_key_values'].key_cache, 
+                #                                                         negative_model_kwargs['past_key_values'].value_cache)):
+                #         # Process each non-diffusion sample
+                #         for sample_idx, start_idx in zip(non_diffusion_indices.tolist(), start_indices.tolist()):
+                #             if start_idx + 1 < k_cache.shape[2] - 1:
+                #                 # Shift cache for this sample
+                #                 k_cache[sample_idx, :, start_idx+1:, :] = k_cache[sample_idx, :, start_idx:-1, :].clone()
+                #                 v_cache[sample_idx, :, start_idx+1:, :] = v_cache[sample_idx, :, start_idx:-1, :].clone()
+                    
+                #     # 3. Update negative_input_ids
+                #     for sample_idx, start_idx in zip(non_diffusion_indices.tolist(), start_indices.tolist()):
+                #         if start_idx + 1 < negative_input_ids.shape[1] - 1:
+                #             negative_input_ids[sample_idx, start_idx+1:] = \
+                #                 negative_input_ids[sample_idx, start_idx:-1].clone()
+                                
+                #     correct_cnt[non_diffusion_indices] += 1
+
+                positive_condition = outputs.last_hidden_state[diffusion_indices, -1, :]
+                negative_condition = negative_outputs.last_hidden_state[diffusion_indices, -1, :]
+                
+                speech_latent = self.sample_speech_tokens(
+                    positive_condition,
+                    negative_condition,
+                    cfg_scale=cfg_scale,
+                ).unsqueeze(1)
+                                
+                # Decode acoustic latent to audio using acoustic streaming cache
+                scaled_latent = speech_latent / self.model.speech_scaling_factor - self.model.speech_bias_factor
+                audio_chunk = self.model.acoustic_tokenizer.decode(
+                    scaled_latent,
+                    cache=acoustic_cache,  # Use acoustic-specific cache
+                    sample_indices=diffusion_indices,
+                    use_cache=True,
+                    debug=False
+                )
+                
+                # Store audio chunks for each sample
+                for i, sample_idx in enumerate(diffusion_indices):
+                    idx = sample_idx.item()
+                    # Only append audio chunk if the sample is not finished
+                    if not finished_tags[idx]:
+                        audio_chunks[idx].append(audio_chunk[i])
 
                 # Encode audio to semantic features using semantic streaming cache
                 semantic_features = self.model.semantic_tokenizer.encode(

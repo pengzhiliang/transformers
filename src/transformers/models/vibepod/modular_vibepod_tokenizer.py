@@ -984,7 +984,9 @@ class VibePodAcousticTokenizerModel(PreTrainedModel):
     
     config_class = VibePodAcousticTokenizerConfig
     base_model_prefix = "vibepod_acoustic_tokenizer"
-    
+    _supports_flash_attn_2 = True  
+    _supports_sdpa = True  
+
     def __init__(self, config):
         super().__init__(config)
         
@@ -1098,7 +1100,9 @@ class VibePodSemanticTokenizerModel(PreTrainedModel):
     
     config_class = VibePodSemanticTokenizerConfig
     base_model_prefix = "vibepod_semantic_tokenizer"
-    
+    _supports_flash_attn_2 = True  
+    _supports_sdpa = True  
+
     def __init__(self, config):
         super().__init__(config)
         

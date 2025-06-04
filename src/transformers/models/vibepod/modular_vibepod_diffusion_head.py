@@ -215,7 +215,9 @@ class VibePodDiffusionHead(PreTrainedModel):
         latent_size (`int`, optional): Size of the latent space. If not provided, uses `config.latent_size`.
     """
     config_class = VibePodDiffusionHeadConfig
-
+    _supports_flash_attn_2 = True  
+    _supports_sdpa = True  
+    
     def __init__(
         self,
         config,
