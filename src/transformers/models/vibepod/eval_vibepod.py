@@ -161,6 +161,51 @@ def main():
     #     print(f"Saved output to {output_path}")
 
     # ==================================================================
+    # start_time = time.time()
+    # for sample_script, sample_voice, sample_name in zip(scripts, voice_samples, save_names):
+    #     print(f"Processing sample: {sample_name}")
+    #     sample_input = processor(
+    #         text=[sample_script],
+    #         voice_samples=[sample_voice],
+    #         padding=True,
+    #         return_tensors="pt",
+    #         return_attention_mask=True,
+    #     )
+    #     sample_outputs = model.generate_negative_without_start_end_token(
+    #         **sample_input,
+    #         max_new_tokens=None,
+    #         cfg_scale=1.3,
+    #         tokenizer=processor.tokenizer,
+    #     )
+    #     output_path = f"/mnt/conversationhub/zhiliang/exp/podcast_eval/transformers_single_generate_negative_without_start_end_token/{sample_name}.wav"
+    #     os.makedirs(os.path.dirname(output_path), exist_ok=True)
+    #     processor.save_audio(
+    #         sample_outputs.speech_outputs[0],
+    #         output_path=output_path,
+    #     )
+    #     print(f"Saved output to {output_path}")
+    # print(f"Single sample generation time: {time.time() - start_time:.2f} seconds")
+
+    # ==================================================================
+    start_time = time.time()
+    outputs = model.generate_refresh_negative(
+        **inputs,
+        max_new_tokens=None,
+        cfg_scale=1.3,
+        tokenizer=processor.tokenizer,
+    )
+    print(f"Generation time: {time.time() - start_time:.2f} seconds")
+
+    for i, save_name in enumerate(save_names):
+        output_path = f"/mnt/conversationhub/zhiliang/exp/podcast_eval/transformers_batch_generate_refresh_negative/{save_name}.wav"
+        os.makedirs(os.path.dirname(output_path), exist_ok=True)
+        processor.save_audio(
+            outputs.speech_outputs[i],
+            output_path=output_path,
+        )
+        print(f"Saved output to {output_path}")
+
+    # ==================================================================
     start_time = time.time()
     for sample_script, sample_voice, sample_name in zip(scripts, voice_samples, save_names):
         print(f"Processing sample: {sample_name}")
@@ -171,13 +216,13 @@ def main():
             return_tensors="pt",
             return_attention_mask=True,
         )
-        sample_outputs = model.generate_negative_without_start_end_token(
+        sample_outputs = model.generate_refresh_negative(
             **sample_input,
             max_new_tokens=None,
             cfg_scale=1.3,
             tokenizer=processor.tokenizer,
         )
-        output_path = f"/mnt/conversationhub/zhiliang/exp/podcast_eval/transformers_single_generate_negative_without_start_end_token/{sample_name}.wav"
+        output_path = f"/mnt/conversationhub/zhiliang/exp/podcast_eval/transformers_single_generate_refresh_negative/{sample_name}.wav"
         os.makedirs(os.path.dirname(output_path), exist_ok=True)
         processor.save_audio(
             sample_outputs.speech_outputs[0],
@@ -186,19 +231,29 @@ def main():
         print(f"Saved output to {output_path}")
     print(f"Single sample generation time: {time.time() - start_time:.2f} seconds")
 
-    
-    # Always test edge cases
-    # test_edge_cases(processor)
-    
-    # print("\n" + "="*50)
-    # print("All tests completed!")
-    # print("="*50)
 
+    # ==================================================================
+    # test one sample
+
+    # sample_input = processor(
+    #     text=[scripts[8], scripts[9]],
+    #     voice_samples=[voice_samples[8], voice_samples[9]],
+    #     padding=True,
+    #     return_tensors="pt",
+    #     return_attention_mask=True,
+    # )
+    # # generate_negative_without_start_end_token
+    # # generate_refresh_negative
+    # sample_outputs = model.generate_refresh_negative(
+    #     **sample_input,
+    #     max_new_tokens=None,
+    #     cfg_scale=1.3,
+    #     tokenizer=processor.tokenizer,
+    # )
+    # processor.save_audio(
+    #         sample_outputs.speech_outputs,
+    #         output_path='./vibepod_outputs',
+    #     )
 
 if __name__ == "__main__":
     main()
-
-# Example usage:
-# python test_vibepod_processor.py --model_path /tmp/vibepod-model
-# python test_vibepod_processor.py --model_path /tmp/vibepod-model --test_batch
-# python test_vibepod_processor.py --model_path /tmp/vibepod-model --voice_samples_dir /path/to/voices
