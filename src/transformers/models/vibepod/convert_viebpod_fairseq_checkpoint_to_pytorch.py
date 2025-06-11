@@ -170,7 +170,7 @@ def rename_fairseq_keys(state_dict: Dict) -> Dict:
         
         # Handle output projection (lm_head)
         elif key == 'output_projection.weight':
-            new_key = 'model.lm_head.weight'
+            new_key = 'lm_head.weight'  # Changed from 'model.lm_head.weight'
         
         # Handle backbone (language model) layers
         elif key.startswith('backbone.'):
@@ -255,6 +255,8 @@ def convert_vibepod_fairseq_checkpoint_to_hf(
         # Set VAE dimensions based on tokenizer configs
         acostic_vae_dim=acoustic_config.vae_dim,
         semantic_vae_dim=semantic_config.vae_dim,
+        tie_word_embeddings=True,
+        torch_dtype="bfloat16",
     )
     
     # Override with provided config if available
@@ -264,11 +266,17 @@ def convert_vibepod_fairseq_checkpoint_to_hf(
             config_dict = json.load(f)
         config = VibePodConfig.from_dict(config_dict)
     
-    # breakpoint()
+    # Set the default dtype to bfloat16 before creating the model
+    original_dtype = torch.get_default_dtype()
+    torch.set_default_dtype(torch.bfloat16)
+
     # Create the HuggingFace model
     logger.info("Creating HuggingFace VibePodForConditionalGeneration model")
     model = VibePodForConditionalGeneration(config)
     
+    # Restore original dtype
+    torch.set_default_dtype(original_dtype)
+
     # Rename keys to match HF format
     logger.info("Renaming checkpoint keys")
     hf_state_dict = rename_fairseq_keys(model_state_dict)
@@ -318,11 +326,11 @@ def convert_vibepod_fairseq_checkpoint_to_hf(
     state_dict = model.state_dict()
     
     # Check if weights are tied (they should point to the same tensor)
-    if 'model.lm_head.weight' in state_dict and 'model.language_model.embed_tokens.weight' in state_dict:
-        if state_dict['model.lm_head.weight'].data_ptr() == state_dict['model.language_model.embed_tokens.weight'].data_ptr():
+    if 'lm_head.weight' in state_dict and 'model.language_model.embed_tokens.weight' in state_dict:
+        if state_dict['lm_head.weight'].data_ptr() == state_dict['model.language_model.embed_tokens.weight'].data_ptr():
             logger.info("Detected tied weights between lm_head and embed_tokens")
             # Remove the tied weight to avoid duplication
-            del state_dict['model.lm_head.weight']
+            del state_dict['lm_head.weight']
     
     # Save model state dict in safetensors format without metadata
     model_path = os.path.join(pytorch_dump_folder_path, "model.safetensors")
@@ -373,3 +381,7 @@ if __name__ == "__main__":
 # python src/transformers/models/vibepod/convert_vibepod_fairseq_checkpoint_to_pytorch.py \
 #     --fairseq_checkpoint_path /mnt/conversationhub/zhiliang/exp/sp_mllm/qwen_1.5b_stream_podcast_v2_4096_text-1_ddpm-diff-5_acous-seman-tok3200x64_lr1e-4_bsz4m_8n_100k/ \
 #     --pytorch_dump_folder_path /tmp/vibepod-model
+
+# python src/transformers/models/vibepod/convert_viebpod_fairseq_checkpoint_to_pytorch.py \
+#     --fairseq_checkpoint_path /mnt/conversationhub/zhiliang/exp/sp_mllm/qwen_1.5b_stream_en-zh-1-1_12288_text-1_ddpm-diff-5_acous-seman-tok3200x64_lr1e-4_bsz3m_2n_40k/checkpoint_1_40000.pt \
+#     --pytorch_dump_folder_path /mnt/conversationhub/zhiliang/exp/sp_mllm/qwen_1.5b_stream_en-zh-1-1_12288_text-1_ddpm-diff-5_acous-seman-tok3200x64_lr1e-4_bsz3m_2n_40k/hf_ckpt_step40k

@@ -116,23 +116,31 @@ class VibePodModel(VibePodPreTrainedModel):
     def __init__(self, config):
         super().__init__(config)
         
+        if hasattr(config, 'torch_dtype') and config.torch_dtype is not None:
+            if isinstance(config.torch_dtype, str):
+                dtype = getattr(torch, config.torch_dtype)
+            else:
+                dtype = config.torch_dtype
+        else:
+            dtype = torch.float32
+        
         # Initialize Qwen2 model for language modeling
         lm_config = config.decoder_config 
         self.language_model = AutoModel.from_config(lm_config)
         
         # Initialize speech components if needed
-        self.acoustic_tokenizer = AutoModel.from_config(config.acoustic_tokenizer_config).to(self.dtype)
-        self.semantic_tokenizer = AutoModel.from_config(config.semantic_tokenizer_config).to(self.dtype)
+        self.acoustic_tokenizer = AutoModel.from_config(config.acoustic_tokenizer_config).to(dtype)
+        self.semantic_tokenizer = AutoModel.from_config(config.semantic_tokenizer_config).to(dtype)
 
-        self.acoustic_connector = SpeechConnector(config.acostic_vae_dim, lm_config.hidden_size).to(self.dtype)
-        self.semantic_connector = SpeechConnector(config.semantic_vae_dim, lm_config.hidden_size).to(self.dtype)
+        self.acoustic_connector = SpeechConnector(config.acostic_vae_dim, lm_config.hidden_size).to(dtype)
+        self.semantic_connector = SpeechConnector(config.semantic_vae_dim, lm_config.hidden_size).to(dtype)
         
         # Register scaling factors as buffers
-        self.register_buffer('speech_scaling_factor', torch.tensor(1.0, dtype=self.dtype))  
-        self.register_buffer('speech_bias_factor', torch.tensor(0.0, dtype=self.dtype))
+        self.register_buffer('speech_scaling_factor', torch.tensor(1.0, dtype=dtype))  
+        self.register_buffer('speech_bias_factor', torch.tensor(0.0, dtype=dtype))
         
         # Initialize prediction head for speech generation
-        self.prediction_head = AutoModel.from_config(config.diffusion_head_config).to(self.dtype)
+        self.prediction_head = AutoModel.from_config(config.diffusion_head_config).to(dtype)
 
         # Initialize noise scheduler
         self.noise_scheduler = DPMSolverMultistepScheduler(
@@ -940,10 +948,29 @@ class VibePodForConditionalGeneration(VibePodPreTrainedModel, GenerationMixin):
         # Initialize audio chunks storage for each sample
         audio_chunks = [[] for _ in range(batch_size)]
 
-        while (~finished_tags).any():
+        initial_length = input_ids.shape[-1]
+        max_steps = min(generation_config.max_length - initial_length, int(2 * initial_length))
+        # Create progress iterator if verbose
+        if kwargs.get("show_progress_bar", True):
+            progress_bar = tqdm(range(max_steps), desc="Generating", leave=False)
+        else:
+            progress_bar = range(max_steps)
+
+        for step in progress_bar:
+            if finished_tags.all():
+                if hasattr(progress_bar, 'set_description'):
+                    progress_bar.set_description("Generation complete")
+                break
+
             if input_ids.shape[-1] >= generation_config.max_length:
                 print(f"Reached maximum generation length {generation_config.max_length}, stopping early.")
                 break
+            
+            # Update progress bar description with active samples
+            if hasattr(progress_bar, 'set_description'):
+                active_samples = (~finished_tags).sum().item()
+                progress_bar.set_description(f"Generating (active: {active_samples}/{batch_size})")
+
             model_inputs = self.prepare_inputs_for_generation(input_ids, **model_kwargs)
             if is_prefill:
                 # we process the speech inputs only during the first generation step
@@ -983,7 +1010,7 @@ class VibePodForConditionalGeneration(VibePodPreTrainedModel, GenerationMixin):
                 # Only print for samples that are newly finished (not already marked as finished)
                 new_eos_indices = eos_indices[~finished_tags[eos_indices]]
                 if new_eos_indices.numel() > 0:
-                    print(f"Reached EOS at indices: {new_eos_indices.tolist()}")
+                    # print(f"Reached EOS at indices: {new_eos_indices.tolist()}")
                     finished_tags[new_eos_indices] = True
                     
             # speech_end
@@ -1422,12 +1449,6 @@ class VibePodForConditionalGeneration(VibePodPreTrainedModel, GenerationMixin):
             speech = self.model.noise_scheduler.step(eps, t, speech).prev_sample
         return speech[: len(speech) // 2]
     
-    
-    def _extract_and_decode_speech(self, token_ids):
-        """Extract speech segments from generated tokens and decode them."""
-        # This would parse token_ids for speech segments and decode them
-        # Placeholder implementation
-        return []
 
     @torch.no_grad()
     def generate_multiple_speeches_semantic_acoustic(
