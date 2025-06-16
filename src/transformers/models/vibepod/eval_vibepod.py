@@ -297,6 +297,6 @@ if __name__ == "__main__":
     main()
 
 # /mnt/conversationhub/zhiliang/exp/sp_mllm/qwen_1.5b_stream_podcast_v2_4096_text-1_ddpm-diff-5_acous-seman-tok3200x64_lr1e-4_bsz4m_8n_100k/hf_ckpt
-# /mnt/conversationhub/zhiliang/exp/sp_mllm/qwen_1.5b_stream_en-zh-1-1_cfg0.1_12288_text-1_ddpm-diff-5_acous-seman-tok3200x64_lr1e-4_bsz3m_2n_40k/hf_ckpt_step10k
+# /mnt/conversationhub/zhiliang/exp/sp_mllm/qwen_1.5b_stream_en-zh-1-1_cfg0.1_12288_text-1_ddpm-diff-5_acous-seman-tok3200x64_lr1e-4_bsz3m_2n_40k/hf_ckpt_step30k
 # /mnt/conversationhub/zhiliang/exp/sp_mllm/qwen_1.5b_stream_en-zh-1-1_12288_text-1_ddpm-diff-5_acous-seman-tok3200x64_lr1e-4_bsz3m_2n_40k/hf_ckpt_step10k
 # /mnt/conversationhub/zhiliang/exp/sp_mllm/qwen_1.5b_stream_en-zh-1-1_12288_text-1_ddpm-diff-5_acous-seman-tok3200x64_lr1e-4_bsz3m_2n_40k/hf_ckpt_step40k

@@ -183,9 +183,9 @@ def main():
     print(f"model name: {model_name}")
 
     # ==================================================================
-    for step in [10, 20, 30, 40, 50]:
+    for step in [50]:
         model.set_ddpm_inference_steps(num_steps=step)
-        for cfg_scale in np.arange(1.0, 3.0, 0.5):
+        for cfg_scale in np.arange(1.5, 3.0, 0.5):
             start_time = time.time()
             outputs = model.generate_refresh_negative(
                 **inputs,
