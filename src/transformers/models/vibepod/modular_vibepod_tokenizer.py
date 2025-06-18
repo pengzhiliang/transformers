@@ -199,13 +199,41 @@ class VibePodTokenizerStreamingCache:
         
     def get(self, layer_id: str, sample_indices: torch.Tensor) -> Optional[torch.Tensor]:
         """Get cached states for given layer and sample indices"""
+        # states = []
+        # for idx in sample_indices.tolist():
+        #     key = (layer_id, idx)
+        #     if key not in self.cache:
+        #         return None  # If any sample is missing, return None
+        #     states.append(self.cache[key])
+        # return torch.stack(states, dim=0)
+    
         states = []
+        max_length = 0
+        
+        # First pass: collect states and find max length
         for idx in sample_indices.tolist():
             key = (layer_id, idx)
             if key not in self.cache:
                 return None  # If any sample is missing, return None
-            states.append(self.cache[key])
-        return torch.stack(states, dim=0)
+            state = self.cache[key]
+            states.append(state)
+            max_length = max(max_length, state.shape[-1])
+        
+        # Second pass: pad states to max length if needed
+        if len(states) > 0 and states[0].dim() >= 2:
+            padded_states = []
+            for state in states:
+                if state.shape[-1] < max_length:
+                    # Pad on the time dimension (last dimension)
+                    pad_size = max_length - state.shape[-1]
+                    # Pad with zeros on the LEFT to align the most recent samples
+                    padded_state = F.pad(state, (pad_size, 0), mode='constant', value=0)
+                    padded_states.append(padded_state)
+                else:
+                    padded_states.append(state)
+            return torch.stack(padded_states, dim=0)
+        else:
+            return torch.stack(states, dim=0)
     
     def set(self, layer_id: str, sample_indices: torch.Tensor, states: torch.Tensor):
         """Set cached states for given layer and sample indices"""
