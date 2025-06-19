@@ -239,6 +239,44 @@ class VibePodForConditionalGeneration(VibePodPreTrainedModel, GenerationMixin):
         # Initialize weights and apply final processing
         self.post_init()
     
+    @property
+    def noise_scheduler(self):
+        return self.model.noise_scheduler
+
+    @property
+    def prediction_head(self):
+        return self.model.prediction_head
+    
+    @property
+    def speech_scaling_factor(self):
+        return self.model.speech_scaling_factor
+
+    @property
+    def speech_bias_factor(self):
+        return self.model.speech_bias_factor
+
+    @property
+    def acoustic_tokenizer(self):
+        return self.model.acoustic_tokenizer
+
+    @property
+    def semantic_tokenizer(self):
+        return self.model.semantic_tokenizer
+    
+    @property
+    def acoustic_connector(self):
+        return self.model.acoustic_connector
+
+    @property
+    def semantic_connector(self):
+        return self.model.semantic_connector
+    
+    def _process_speech_inputs(self, speech_tensors, speech_masks):
+        if hasattr(self.model, '_process_speech_inputs'):
+             return self.model._process_speech_inputs(speech_tensors, speech_masks)
+        else:
+             raise NotImplementedError("_process_speech_inputs is not implemented or proxied correctly.")
+        
     def tie_weights(self):
         """
         Tie the weights between the input embeddings and the output embeddings.

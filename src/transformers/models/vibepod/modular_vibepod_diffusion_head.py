@@ -22,6 +22,7 @@ import torch.nn.functional as F
 
 from ..auto import AutoModel
 from ...modeling_utils import PreTrainedModel
+from ...modeling_layers import GradientCheckpointingLayer
 from ...activations import ACT2FN
 from ...utils import logging
 # from ..llama.modeling_llama import LlamaRMSNorm
@@ -141,7 +142,7 @@ class FeedForwardNetwork(nn.Module):
         return self.down_proj(gate * up)
 
     
-class HeadLayer(nn.Module):
+class HeadLayer(GradientCheckpointingLayer):
     """
     A layer in the diffusion head.
     
@@ -179,7 +180,7 @@ class HeadLayer(nn.Module):
         return x
 
 
-class FinalLayer(nn.Module):
+class FinalLayer(GradientCheckpointingLayer):
     """
     Final layer in the diffusion head.
     
@@ -215,6 +216,7 @@ class VibePodDiffusionHead(PreTrainedModel):
         latent_size (`int`, optional): Size of the latent space. If not provided, uses `config.latent_size`.
     """
     config_class = VibePodDiffusionHeadConfig
+    supports_gradient_checkpointing = True
     _supports_flash_attn_2 = True  
     _supports_sdpa = True  
     
