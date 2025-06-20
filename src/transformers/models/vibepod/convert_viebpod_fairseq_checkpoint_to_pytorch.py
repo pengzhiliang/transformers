@@ -121,6 +121,30 @@ def get_qwen2_config_from_checkpoint(fairseq_dict: Dict) -> Qwen2Config:
         }
         config = Qwen2Config.from_dict(predefined_config)
         pretrained_name = "Qwen/Qwen2.5-1.5B"
+    elif num_layers == 28 and hidden_size == 3584: # 7b model
+        predefined_config = {
+            "hidden_act": "silu",
+            "hidden_size": 3584,
+            "initializer_range": 0.02,
+            "intermediate_size": 18944,
+            "max_position_embeddings": 131072,
+            "max_window_layers": 28,
+            "model_type": "qwen2",
+            "num_attention_heads": 28,
+            "num_hidden_layers": 28,
+            "num_key_value_heads": 4,
+            "rms_norm_eps": 1e-06,
+            "rope_theta": 1000000.0,
+            "sliding_window": 131072,
+            "tie_word_embeddings": True,
+            "torch_dtype": "bfloat16",
+            "use_cache": True,
+            "use_sliding_window": False,
+            "vocab_size": 152064,
+            "attention_dropout": 0.0,
+        }
+        config = Qwen2Config.from_dict(predefined_config)
+        pretrained_name = "Qwen/Qwen2.5-7B"
     else:
         raise NotImplementedError(
             f"Unsupported Qwen2 configuration: {num_layers} layers with hidden size {hidden_size}. "
