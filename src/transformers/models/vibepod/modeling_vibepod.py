@@ -43,6 +43,13 @@ from .configuration_vibepod import VibePodConfig
 
 from .modular_vibepod_text_tokenizer import VibePodTextTokenizer, VibePodTextTokenizerFast
 
+# import sys
+# sys.path.insert(0, "/data/yaoyaochang/code/speech/nano-vllm")
+# from nanovllm.models.qwen2 import Qwen2Model
+from nanovllm import LLM, SamplingParams
+from transformers import AutoTokenizer
+import os
+
 logger = logging.get_logger(__name__)
 
 import pdb
@@ -126,7 +133,6 @@ class VibePodModel(VibePodPreTrainedModel):
         
         # Initialize Qwen2 model for language modeling
         lm_config = config.decoder_config 
-        self.language_model = AutoModel.from_config(lm_config)
         
         # Initialize speech components if needed
         self.acoustic_tokenizer = AutoModel.from_config(config.acoustic_tokenizer_config).to(dtype)
@@ -149,8 +155,23 @@ class VibePodModel(VibePodPreTrainedModel):
             prediction_type=config.diffusion_head_config.prediction_type
         )
         
+        
+        # self.language_model = AutoModel.from_config(lm_config)
+        # self.language_model = Qwen2Model(config=lm_config)
+
+        self.llm = None
+        self.load_nano_vllm()
+        self.language_model = self.llm.model_runner.model
+        
         # Initialize weights
         self.post_init()
+    
+    def load_nano_vllm(self):        
+        path = os.path.expanduser("/data/yaoyaochang/code/speech/data/Qwen/Qwen2.5-1.5B")
+        if self.llm is None:
+            self.tokenizer = AutoTokenizer.from_pretrained(path)
+            self.llm = LLM(path, enforce_eager=True, tensor_parallel_size=1, cuda_start_idx=2)
+        return self
     
     def get_input_embeddings(self):
         return self.language_model.embed_tokens
@@ -187,19 +208,69 @@ class VibePodModel(VibePodPreTrainedModel):
         
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
         
+        # print(f"VibePodModel forward: return_dict={return_dict}")
+        # print(f"use_cache={use_cache}")
+        # print(f"past_key_values={past_key_values}")
+        # print(f"input_ids={input_ids}")
+        # print(f"attention_mask={attention_mask}")
+        # print(f"position_ids={position_ids}")
+        # print(f"past_key_values={past_key_values}")
+        # print(f"inputs_embeds={inputs_embeds}")
+        # print(f"inputs_embeds.shape={inputs_embeds.shape}")
+        # print(f"output_attentions={output_attentions}")
+        # print(f"output_hidden_states={output_hidden_states}")
+        # print(f"cache_position={cache_position}")
+        '''VibePodModel forward: return_dict=True
+use_cache=True
+past_key_values=<transformers.cache_utils.DynamicCache object at 0x79469955fd10>
+input_ids=None
+attention_mask=tensor([[1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
+         1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
+         1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
+         1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
+         1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
+         1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
+         1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
+         1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
+         1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
+         1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
+         1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
+         1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
+         1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
+         1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
+         1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
+         1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
+         1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
+         1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
+         1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
+         1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
+         1, 1, 1, 1, 1]], device='cuda:2')
+position_ids=tensor([[484]], device='cuda:2')
+past_key_values=<transformers.cache_utils.DynamicCache object at 0x79469955fd10>
+inputs_embeds=tensor([[[-0.4707, -0.4395,  0.1006,  ...,  0.0417,  0.3789, -0.1914]]],
+       device='cuda:2', dtype=torch.bfloat16)
+inputs_embeds.shape=torch.Size([1, 1, 1536]) # 1536是decoder_config.hidden_size
+output_attentions=False
+output_hidden_states=False
+cache_position=tensor([484], device='cuda:2')'''
+
         # Forward through language model
+        # outputs = self.language_model(
+        #     input_ids=input_ids,
+        #     attention_mask=attention_mask,
+        #     position_ids=position_ids,
+        #     past_key_values=past_key_values,
+        #     inputs_embeds=inputs_embeds,
+        #     use_cache=use_cache,
+        #     output_attentions=output_attentions,
+        #     output_hidden_states=output_hidden_states,
+        #     return_dict=return_dict,
+        #     cache_position=cache_position,
+        #     **kwargs,
+        # )               
         outputs = self.language_model(
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-            position_ids=position_ids,
-            past_key_values=past_key_values,
-            inputs_embeds=inputs_embeds,
-            use_cache=use_cache,
-            output_attentions=output_attentions,
-            output_hidden_states=output_hidden_states,
-            return_dict=return_dict,
-            cache_position=cache_position,
-            **kwargs,
+            positions = cache_position,
+            hidden_states=inputs_embeds.squeeze(0)            
         )
         
         if not return_dict:
@@ -223,6 +294,15 @@ class KwargsForCausalLM(FlashAttentionKwargs, LossKwargs): ...
 )
 class VibePodForConditionalGeneration(VibePodPreTrainedModel, GenerationMixin):
     _tied_weights_keys = ["lm_head.weight"]
+    
+    
+    packed_modules_mapping = {
+        "q_proj": ("qkv_proj", "q"),
+        "k_proj": ("qkv_proj", "k"),
+        "v_proj": ("qkv_proj", "v"),
+        "gate_proj": ("gate_up_proj", 0),
+        "up_proj": ("gate_up_proj", 1),
+    }
     
     def __init__(self, config):
         super().__init__(config)
@@ -284,7 +364,9 @@ class VibePodForConditionalGeneration(VibePodPreTrainedModel, GenerationMixin):
         # Tie lm_head.weight to language_model.embed_tokens.weight
         if hasattr(self, 'lm_head') and hasattr(self.model.language_model, 'embed_tokens'):
             self.lm_head.weight = self.model.language_model.embed_tokens.weight
-        
+        # if hasattr(self, 'lm_head') and hasattr(self.model.llm.model_runner.model, 'embed_tokens'):
+        #     self.lm_head.weight = self.model.llm.model_runner.model.embed_tokens.weight
+
     def get_input_embeddings(self):
         return self.model.get_input_embeddings()
     

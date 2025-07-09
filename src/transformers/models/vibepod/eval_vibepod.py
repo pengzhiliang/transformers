@@ -39,6 +39,10 @@ from transformers.tokenization_utils_base import PaddingStrategy
 from transformers.utils import logging
 
 
+# import sys
+# sys.path.insert(0, "/data/yaoyaochang/code/speech/nano-vllm")
+from nanovllm.utils.loader import load_model
+
 logging.set_verbosity_info()
 logger = logging.get_logger(__name__)
 
@@ -68,6 +72,7 @@ def parse_args():
 
 def main():
     args = parse_args()
+
 
     save_names = []
     scripts = []
@@ -141,6 +146,9 @@ def main():
         device_map=args.device,
         attn_implementation="flash_attention_2",
     )
+    # print("load model in eval_vibepod.py")
+    # load_model(model.model.llm.model_runner.model, "/data/yaoyaochang/code/speech/data/Qwen/Qwen2.5-1.5B")
+    # load_model(model.model.language_model, "/data/yaoyaochang/code/speech/data/Qwen/Qwen2.5-1.5B-from-vibepod")
 
     model.eval()
     model.set_ddpm_inference_steps(num_steps=5)
