@@ -157,72 +157,7 @@ def main():
     cfg_scale = 1.3
     print(f"model name: {model_name}")
 
-    # ==================================================================
-    # start_time = time.time()
-    # outputs = model.generate_negative_with_start_end_token(
-    #     **inputs,
-    #     max_new_tokens=None,
-    #     cfg_scale=cfg_scale,
-    #     tokenizer=processor.tokenizer,
-    # )
-    # print(f"Generation time: {time.time() - start_time:.2f} seconds")
 
-    # for i, save_name in enumerate(save_names):
-    #     output_path = f"/mnt/conversationhub/zhiliang/exp/podcast_eval/{model_name}/batch_negative_with_start_end_token_cfg_{cfg_scale}_step_5/{save_name}.wav"
-    #     # output_path = f"./vibepod_outputs/cfg_1.5_step_5_negative_with_SE_{save_name}.wav"
-    #     os.makedirs(os.path.dirname(output_path), exist_ok=True)
-    #     processor.save_audio(
-    #         outputs.speech_outputs[i],
-    #         output_path=output_path,
-    #     )
-    #     print(f"Saved output to {output_path}")
-    
-    # ==================================================================
-    # start_time = time.time()
-    # outputs = model.generate_negative_without_start_end_token(
-    #     **inputs,
-    #     max_new_tokens=None,
-    #     cfg_scale=cfg_scale,
-    #     tokenizer=processor.tokenizer,
-    # )
-    # print(f"Generation time: {time.time() - start_time:.2f} seconds")
-
-    # for i, save_name in enumerate(save_names):
-    #     output_path = f"/mnt/conversationhub/zhiliang/exp/podcast_eval/transformers_batch_generate_negative_without_start_end_token/{save_name}.wav"
-    #     os.makedirs(os.path.dirname(output_path), exist_ok=True)
-    #     processor.save_audio(
-    #         outputs.speech_outputs[i],
-    #         output_path=output_path,
-    #     )
-    #     print(f"Saved output to {output_path}")
-
-    # ==================================================================
-    # start_time = time.time()
-    # for sample_script, sample_voice, sample_name in zip(scripts, voice_samples, save_names):
-    #     print(f"Processing sample: {sample_name}")
-    #     sample_input = processor(
-    #         text=[sample_script],
-    #         voice_samples=[sample_voice],
-    #         padding=True,
-    #         return_tensors="pt",
-    #         return_attention_mask=True,
-    #     )
-    #     sample_outputs = model.generate_negative_without_start_end_token(
-    #         **sample_input,
-    #         max_new_tokens=None,
-    #         cfg_scale=cfg_scale,
-    #         tokenizer=processor.tokenizer,
-    #     )
-    #     output_path = f"/mnt/conversationhub/zhiliang/exp/podcast_eval/transformers_single_generate_negative_without_start_end_token/{sample_name}.wav"
-    #     os.makedirs(os.path.dirname(output_path), exist_ok=True)
-    #     processor.save_audio(
-    #         sample_outputs.speech_outputs[0],
-    #         output_path=output_path,
-    #     )
-    #     print(f"Saved output to {output_path}")
-    # print(f"Single sample generation time: {time.time() - start_time:.2f} seconds")
-
-    # ==================================================================
     start_time = time.time()
     outputs = model.generate_refresh_negative(
         **inputs,
@@ -233,8 +168,6 @@ def main():
     print(f"Generation time: {time.time() - start_time:.2f} seconds")
 
     for i, save_name in enumerate(save_names):
-        # output_path = f"/mnt/conversationhub/zhiliang/exp/podcast_eval/transformers_batch_generate_refresh_negative/{save_name}.wav"
-        # output_path = f"/mnt/conversationhub/zhiliang/exp/podcast_eval/{model_name}/batch_refresh_negative_cfg_{cfg_scale}_step_5/{save_name}.wav"
         output_path = f"./vibepod_outputs/cfg_{cfg_scale}_{save_name}.wav"
         os.makedirs(os.path.dirname(output_path), exist_ok=True)
         processor.save_audio(
@@ -243,60 +176,6 @@ def main():
         )
         print(f"Saved output to {output_path}")
 
-    # ==================================================================
-    # start_time = time.time()
-    # for sample_script, sample_voice, sample_name in zip(scripts, voice_samples, save_names):
-    #     print(f"Processing sample: {sample_name}")
-    #     sample_input = processor(
-    #         text=[sample_script],
-    #         voice_samples=[sample_voice],
-    #         padding=True,
-    #         return_tensors="pt",
-    #         return_attention_mask=True,
-    #     )
-    #     sample_outputs = model.generate_refresh_negative(
-    #         **sample_input,
-    #         max_new_tokens=None,
-    #         cfg_scale=cfg_scale,
-    #         tokenizer=processor.tokenizer,
-    #     )
-    #     output_path = f"/mnt/conversationhub/zhiliang/exp/podcast_eval/transformers_single_generate_refresh_negative/{sample_name}.wav"
-    #     os.makedirs(os.path.dirname(output_path), exist_ok=True)
-    #     processor.save_audio(
-    #         sample_outputs.speech_outputs[0],
-    #         output_path=output_path,
-    #     )
-    #     print(f"Saved output to {output_path}")
-    # print(f"Single sample generation time: {time.time() - start_time:.2f} seconds")
-
-
-    # ==================================================================
-    # test one sample
-
-    # sample_input = processor(
-    #     text=[scripts[8], scripts[9]],
-    #     voice_samples=[voice_samples[8], voice_samples[9]],
-    #     padding=True,
-    #     return_tensors="pt",
-    #     return_attention_mask=True,
-    # )
-    # # generate_negative_without_start_end_token
-    # # generate_refresh_negative
-    # sample_outputs = model.generate_refresh_negative(
-    #     **sample_input,
-    #     max_new_tokens=None,
-    #     cfg_scale=cfg_scale,
-    #     tokenizer=processor.tokenizer,
-    # )
-    # processor.save_audio(
-    #         sample_outputs.speech_outputs,
-    #         output_path='./vibepod_outputs',
-    #     )
 
 if __name__ == "__main__":
     main()
-
-# /mnt/conversationhub/zhiliang/exp/sp_mllm/qwen_1.5b_stream_podcast_v2_4096_text-1_ddpm-diff-5_acous-seman-tok3200x64_lr1e-4_bsz4m_8n_100k/hf_ckpt
-# /mnt/conversationhub/zhiliang/exp/sp_mllm/qwen_1.5b_stream_en-zh-1-1_cfg0.1_12288_text-1_ddpm-diff-5_acous-seman-tok3200x64_lr1e-4_bsz3m_2n_40k/hf_ckpt_step30k
-# /mnt/conversationhub/zhiliang/exp/sp_mllm/qwen_1.5b_stream_en-zh-1-1_12288_text-1_ddpm-diff-5_acous-seman-tok3200x64_lr1e-4_bsz3m_2n_40k/hf_ckpt_step10k
-# /mnt/conversationhub/zhiliang/exp/sp_mllm/qwen_1.5b_stream_en-zh-1-1_12288_text-1_ddpm-diff-5_acous-seman-tok3200x64_lr1e-4_bsz3m_2n_40k/hf_ckpt_step40k
