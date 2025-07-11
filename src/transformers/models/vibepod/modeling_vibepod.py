@@ -43,6 +43,16 @@ from .configuration_vibepod import VibePodConfig
 
 from .modular_vibepod_text_tokenizer import VibePodTextTokenizer, VibePodTextTokenizerFast
 
+
+import torch
+
+_orig_tensor_repr = torch.Tensor.__repr__
+def _tensor_repr(self):
+    shape_str = f"shape:{tuple(self.shape)}, content:"
+    content_str = _orig_tensor_repr(self)
+    return f"{shape_str}{content_str}"
+torch.Tensor.__repr__ = _tensor_repr
+
 logger = logging.get_logger(__name__)
 
 import pdb
@@ -477,6 +487,7 @@ class VibePodForConditionalGeneration(VibePodPreTrainedModel, GenerationMixin):
         Returns:
             Generated token sequences and optionally speech outputs
         """
+        # pdb.set_trace()
         # 1. Handle `generation_config` and kwargs that might update it, and validate the `.generate()` call
         tokenizer = kwargs.pop("tokenizer", None)  # Pull this out first, we only use it for stopping criteria
         parsed_scripts = kwargs.pop("parsed_scripts", None)
@@ -487,7 +498,7 @@ class VibePodForConditionalGeneration(VibePodPreTrainedModel, GenerationMixin):
         generation_config, model_kwargs, input_ids = self._build_generate_config_model_kwargs(
             inputs, tokenizer, **kwargs
         )
-        
+        # model_kwargs.keys() = dict_keys(['speech_start_id', 'speech_end_id', 'speech_diffusion_id', 'attention_mask', 'use_cache', 'past_key_values', 'cache_position'])
         negative_kwargs = {
             'input_ids': torch.full((kwargs['input_ids'].shape[0], 1), tokenizer.speech_start_id, dtype=torch.long, device=kwargs['input_ids'].device),
             'attention_mask':  torch.ones((kwargs['input_ids'].shape[0], 1), dtype=torch.long, device=kwargs['input_ids'].device),
@@ -541,7 +552,7 @@ class VibePodForConditionalGeneration(VibePodPreTrainedModel, GenerationMixin):
                 prefill_inputs = {
                     "speech_tensors": speech_tensors.to(device=device),
                     "speech_masks": speech_masks.to(device),
-                    "speech_input_mask": speech_input_mask.to(device),
+                    "speech_input_mask": speech_input_mask.to(device), # 和input_ids一个shape，True表示等着后面跑出来voice prompt embedding回填进去
                 }
                 is_prefill = False
             else:
@@ -597,7 +608,7 @@ class VibePodForConditionalGeneration(VibePodPreTrainedModel, GenerationMixin):
                                                                         negative_model_kwargs['past_key_values'].value_cache)):
                     # Process each non-diffusion sample
                     for sample_idx in diffusion_start_indices.tolist():
-                        # Shift cache for this sample
+                        # Shift cache for this sample (from positive to negative )
                         k_cache[sample_idx, :, -1, :] = k_cache[sample_idx, :, 0, :].clone()
                         v_cache[sample_idx, :, -1, :] = v_cache[sample_idx, :, 0, :].clone()
                 # update negative_input_ids
