@@ -17,6 +17,7 @@ class Config:
     kvcache_block_size: int = 256
     num_kvcache_blocks: int = -1
     cuda_start_idx: int = 0
+    vibepod_path: str = None
 
     def __post_init__(self):
         assert os.path.isdir(self.model)

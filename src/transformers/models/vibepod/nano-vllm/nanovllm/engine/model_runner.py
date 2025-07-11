@@ -12,6 +12,8 @@ from nanovllm.layers.sampler import Sampler
 from nanovllm.utils.context import set_context, get_context, reset_context
 from nanovllm.utils.loader import load_model
 
+from transformers.models.vibepod.modeling_vibepod import VibePodForConditionalGeneration
+
 
 class ModelRunner:
 
@@ -23,6 +25,14 @@ class ModelRunner:
         self.world_size = config.tensor_parallel_size
         self.rank = rank
         self.event = event
+        
+        self.vibepod = VibePodForConditionalGeneration.from_pretrained(
+            config.vibepod_path,
+            torch_dtype=torch.bfloat16,
+            device_map=config.cuda_start_idx,
+            attn_implementation="flash_attention_2",
+        )
+        # load_model(self.vibepod, config.vibepod_path)
     
         dist.init_process_group("nccl", "tcp://localhost:2333", world_size=self.world_size, rank=rank)
         torch.cuda.set_device(rank + config.cuda_start_idx)
@@ -30,10 +40,10 @@ class ModelRunner:
         torch.set_default_dtype(hf_config.torch_dtype)
         torch.set_default_device("cuda")
         # self.model = Qwen3ForCausalLM(hf_config)
-        self.model = Qwen2ForCausalLM(hf_config) # for this repo
-        load_model(self.model, config.model)
-        # self.model = Qwen2Model(hf_config) # for transformers
-        # load_model(self.model, "/data/yaoyaochang/code/speech/data/Qwen/Qwen2.5-1.5B-from-vibepod2")
+        # self.model = Qwen2ForCausalLM(hf_config) # for this repo
+        # load_model(self.model, config.model)
+        self.model = Qwen2Model(hf_config) # for transformers
+        load_model(self.model, "/data/yaoyaochang/code/speech/data/Qwen/Qwen2.5-1.5B-from-vibepod2")
         self.sampler = Sampler()
         self.allocate_kv_cache(config.gpu_memory_utilization)
         if not self.enforce_eager:

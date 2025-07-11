@@ -14,11 +14,11 @@ from nanovllm.engine.model_runner import ModelRunner
 
 class LLMEngine:
 
-    def __init__(self, model, **kwargs):
+    def __init__(self, **kwargs):
         config_fields = {field.name for field in fields(Config)}
         config_kwargs = {k: v for k, v in kwargs.items() if k in config_fields}
         print(f"LLMEngine: config_kwargs={config_kwargs}")
-        config = Config(model, **config_kwargs)
+        config = Config(kwargs['qwen_path'], **config_kwargs)
         self.ps = []
         self.events = []
         ctx = mp.get_context("spawn")
@@ -30,7 +30,7 @@ class LLMEngine:
             self.ps.append(process)
             self.events.append(event)
         self.model_runner = ModelRunner(config, 0, self.events)
-        self.tokenizer = AutoTokenizer.from_pretrained(config.model, use_fast=True)
+        self.tokenizer = kwargs.get("tokenizer")
         config.eos = self.tokenizer.eos_token_id
         self.scheduler = Scheduler(config)
         atexit.register(self.exit)
@@ -44,7 +44,9 @@ class LLMEngine:
     def add_request(self, prompt: str | list[int], sampling_params: SamplingParams):
         # 把一个prompt（字符串或token id列表）转换为Sequence对象，并添加到scheduler中
         if isinstance(prompt, str):
+            # print(f"Encoding prompt: {prompt!r}")
             prompt = self.tokenizer.encode(prompt)
+            # print(f"Encoded prompt: {prompt!r}")
         seq = Sequence(prompt, sampling_params)
         self.scheduler.add(seq)
 
