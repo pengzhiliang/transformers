@@ -68,14 +68,14 @@ class Scheduler:
         self.block_manager.deallocate(seq)
         self.waiting.appendleft(seq)
 
-    def postprocess(self, seqs: list[Sequence], token_ids: list[int]) -> list[bool]:
+    def postprocess(self, seqs: list[Sequence], hidden_states, next_tokens) -> list[bool]:
         '''
         把model返回的token id写回各个sequence。
         如果有decode出eos，或者填满了max_tokens，就标记sequence为FINISHED，并从running中删除。
         '''
-        for seq, token_id in zip(seqs, token_ids):
-            seq.append_token(token_id)
-            if (not seq.ignore_eos and token_id == self.eos) or seq.num_completion_tokens == seq.max_tokens:
-                seq.status = SequenceStatus.FINISHED
-                self.block_manager.deallocate(seq)
-                self.running.remove(seq)
+        for seq, hidden_state, next_token in zip(seqs, hidden_states, next_tokens):
+            seq.append_token(next_token.cpu(), hidden_state.squeeze(0).cpu())
+            # if (not seq.ignore_eos and next_token == self.eos) or seq.num_completion_tokens == seq.max_tokens:
+            #     seq.status = SequenceStatus.FINISHED
+            #     self.block_manager.deallocate(seq)
+            #     self.running.remove(seq)

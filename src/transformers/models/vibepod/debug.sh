@@ -1,2 +1,3 @@
 # python eval_vibepod.py --model_path /data/yaoyaochang/code/speech/data/model/qwen_1.5b_stream_podcast_v2_4096_text-1_ddpm-diff-5_acous-seman-tok3200x64_lr1e-4_bsz4m_8n_100k --scp_path /data/yaoyaochang/code/speech/data/samples/deepseekR1_short.json --device cuda:2
-python eval_vibepod.py --model_path /data/yaoyaochang/code/speech/data/model/qwen_1.5b_stream_podcast_v2_4096_text-1_ddpm-diff-5_acous-seman-tok3200x64_lr1e-4_bsz4m_8n_100k --scp_path /data/yaoyaochang/code/speech/data/samples/short.scp --device cuda:2
+export CUDA_VISIBLE_DEVICES=3
+python eval_vibepod.py --model_path /data/yaoyaochang/code/speech/data/model/qwen_1.5b_stream_podcast_v2_4096_text-1_ddpm-diff-5_acous-seman-tok3200x64_lr1e-4_bsz4m_8n_100k --scp_path /data/yaoyaochang/code/speech/data/samples/short.scp 
