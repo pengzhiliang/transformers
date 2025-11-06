@@ -129,8 +129,9 @@ def input_process(txt_content: str, voices: List[str]) -> Tuple[str, List[str]]:
 
 def main():
     model_path = "microsoft/VibeVoice-1.5b"
-    cfg_scale = "1.3"
-    generated_audio_name = "./outputs/generated.wav"
+    cfg_scale = 1.3
+    generated_audio_path = os.path.join(os.path.dirname(__file__), "outputs", "generated_audio.wav")
+    os.makedirs(os.path.dirname(generated_audio_path), exist_ok=True)
     # Please follow the format below to add new scripts and voices
     conversation = [
 	    {"role": "0", "content": [{"type": "text", "text": "Hello, how are you?"}]},
@@ -142,7 +143,7 @@ def main():
 
     # Only five voices for use
     # 'en-Alice_woman', 'en-Ben_man', 'en-Carter_man', 'en-Maya_woman', 'in-Samuel_man'
-    voices = ["en-Alice_woman", "en-Ben_man"]
+    voices = ["en-Alice_woman", "en-Carter_man"]
     full_script, voice_samples = input_process(conversation, voices)
 
     processor = VibeVoiceProcessor.from_pretrained(model_path)
@@ -155,7 +156,6 @@ def main():
 
     model.eval()
     model.set_ddpm_inference_steps(num_steps=10)
-
     inputs = processor(
         text=[full_script], 
         voice_samples=[voice_samples], 
@@ -175,7 +175,7 @@ def main():
 
     processor.save_audio(
         outputs.speech_outputs[0],  # First (and only) batch item
-        output_path=generated_audio_name,
+        output_path=generated_audio_path,
     )
 
 if __name__ == "__main__":
@@ -382,7 +382,7 @@ def process_batch(batch, model, processor, cfg_scale):
 
 def main():
     model_path = "microsoft/VibeVoice-1.5b"
-    cfg_scale = "1.3"
+    cfg_scale = 1.3
     # Please follow the format below to add new scripts and voices
     conversation_1 = [
 	    {"role": "0", "content": [{"type": "text", "text": "Hello, how are you?"}]},
