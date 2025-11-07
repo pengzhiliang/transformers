@@ -101,6 +101,44 @@ def format_conversation_to_script(conversation_data: List[Dict[str, Any]]) -> Tu
 
     return script_lines, speaker_ids
 
+def script_to_chat_template(scripts: str) -> list:
+    conversation = []
+    lines = [line.strip() for line in scripts.strip().split('\n') if line.strip()]
+    speaker_pattern = r'^Speaker\s+(\d+):\s*(.*)$'
+    current_speaker = None
+    current_text = ""
+    for line in lines:
+        try:
+            match = re.match(speaker_pattern, line, re.IGNORECASE)
+            if match:
+                if current_speaker and current_text:
+                    chat_entry = {
+                        "role": current_speaker,
+                        "content": [{"type": "text", "text": current_text.strip()}]
+                    }
+                    
+                    conversation.append(chat_entry)
+                # Start new speaker
+                current_speaker = match.group(1).strip()
+                current_text = match.group(2).strip()
+            else:
+                if current_text:
+                    current_text += " " + line
+                else:
+                    current_text = line
+        except Exception as e:
+            print(f"Error processing line '{line}': {e}")
+            continue
+
+    if current_speaker and current_text:
+        chat_entry = {
+            "role": current_speaker,
+            "content": [{"type": "text", "text": current_text.strip()}]
+        }
+        
+        conversation.append(chat_entry)
+    return conversation
+
 def input_process(txt_content: str, voices: List[str]) -> Tuple[str, List[str]]:
     voice_mapper = VoiceMapper()
     scripts, speaker_numbers = format_conversation_to_script(txt_content)
@@ -262,6 +300,44 @@ def format_conversation_to_script(conversation_data: List[Dict[str, Any]]) -> Tu
             speaker_ids.append(role_id)
 
     return script_lines, speaker_ids
+
+def script_to_chat_template(scripts: str) -> list:
+    conversation = []
+    lines = [line.strip() for line in scripts.strip().split('\n') if line.strip()]
+    speaker_pattern = r'^Speaker\s+(\d+):\s*(.*)$'
+    current_speaker = None
+    current_text = ""
+    for line in lines:
+        try:
+            match = re.match(speaker_pattern, line, re.IGNORECASE)
+            if match:
+                if current_speaker and current_text:
+                    chat_entry = {
+                        "role": current_speaker,
+                        "content": [{"type": "text", "text": current_text.strip()}]
+                    }
+                    
+                    conversation.append(chat_entry)
+                # Start new speaker
+                current_speaker = match.group(1).strip()
+                current_text = match.group(2).strip()
+            else:
+                if current_text:
+                    current_text += " " + line
+                else:
+                    current_text = line
+        except Exception as e:
+            print(f"Error processing line '{line}': {e}")
+            continue
+
+    if current_speaker and current_text:
+        chat_entry = {
+            "role": current_speaker,
+            "content": [{"type": "text", "text": current_text.strip()}]
+        }
+        
+        conversation.append(chat_entry)
+    return conversation
 
 def input_process(txt_content: str, voices: List[str]) -> Tuple[str, List[str]]:
     voice_mapper = VoiceMapper()
