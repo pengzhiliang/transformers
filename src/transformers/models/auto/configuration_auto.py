@@ -420,6 +420,7 @@ CONFIG_MAPPING_NAMES = OrderedDict[str, str](
         ("vaultgemma", "VaultGemmaConfig"),
         ("vibevoice", "VibeVoiceConfig"),
         ("vibevoice_acoustic_tokenizer", "VibeVoiceAcousticTokenizerConfig"),
+        ("vibevoice_diffusion_head", "VibeVoiceDiffusionHeadConfig"),
         ("vibevoice_semantic_tokenizer", "VibeVoiceSemanticTokenizerConfig"),
         ("video_llama_3", "VideoLlama3Config"),
         ("video_llama_3_vision", "VideoLlama3VisionConfig"),
@@ -885,6 +886,7 @@ MODEL_NAMES_MAPPING = OrderedDict[str, str](
         ("vaultgemma", "VaultGemma"),
         ("vibevoice", "VibeVoice"),
         ("vibevoice_acoustic_tokenizer", "VibeVoiceAcousticTokenizer"),
+        ("vibevoice_diffusion_head", "VibeVoiceDiffusionHead"),
         ("vibevoice_semantic_tokenizer", "VibeVoiceSemanticTokenizer"),
         ("video_llama_3", "VideoLlama3"),
         ("video_llama_3_vision", "VideoLlama3Vision"),
@@ -1010,6 +1012,7 @@ SPECIAL_MODEL_TYPE_TO_MODULE_NAME = OrderedDict[str, str](
         ("video_llama_3_vision", "video_llama_3"),
         ("parakeet_encoder", "parakeet"),
         ("parakeet_ctc", "parakeet"),
+        ("vibevoice_diffusion_head", "vibevoice"),
     ]
 )
 
