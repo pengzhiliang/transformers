@@ -42,15 +42,11 @@ class VibeVoiceGenerateOutput(GenerateDecoderOnlyOutput):
     Outputs of VibeVoiceForConditionalGeneration.generate.
 
     Args:
-        sequences (`torch.LongTensor` of shape `(batch_size, sequence_length)`):
-            The generated sequences.
         speech_outputs (`List[torch.FloatTensor]`, *optional*):
             List of generated speech waveforms for each speech segment.
         reach_max_step_sample (`torch.BoolTensor`, *optional*):
             Boolean tensor indicating which samples reached maximum generation steps.
     """
-    # TODO (ebezzam) necessary to output sequences?
-    sequences: Optional[torch.LongTensor] = None
     speech_outputs: Optional[list[torch.FloatTensor]] = None
     reach_max_step_sample: Optional[torch.BoolTensor] = None
 
@@ -417,10 +413,11 @@ class VibeVoiceGenerationMixin(GenerationMixin):
             # Handle prefill vs normal generation
             if is_prefill:
                 # First step: process speech inputs for conditioning
-                model_inputs.update({
-                    "input_features": input_features.to(device=input_ids.device),
-                    "input_features_mask": input_features_mask.to(input_ids.device),
-                })
+                if input_features is not None and input_features_mask is not None:
+                    model_inputs.update({
+                        "input_features": input_features.to(device=input_ids.device),
+                        "input_features_mask": input_features_mask.to(input_ids.device),
+                    })
                 is_prefill = False
             else:
                 # Subsequent steps: use embeddings from previous step
@@ -529,6 +526,7 @@ class VibeVoiceGenerationMixin(GenerationMixin):
 
             # Handle diffusion tokens
             diffusion_mask = ~finished_tags & (next_tokens == self.config.speech_diffusion_id)
+            negative_outputs = None
             if diffusion_mask.any():
                 diffusion_indices = diffusion_mask.nonzero(as_tuple=False).squeeze(1)
                 
@@ -663,6 +661,7 @@ class VibeVoiceGenerationMixin(GenerationMixin):
 
         if return_dict_in_generate:
             return VibeVoiceGenerateOutput(
+                # TODO: remove and just keeps audio?
                 sequences=input_ids,
                 scores=scores,
                 logits=raw_logits,
