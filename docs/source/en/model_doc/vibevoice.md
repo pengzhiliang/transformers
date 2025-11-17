@@ -21,459 +21,82 @@ The VibeVoice framework integrates three key components:
 - **Scalable LLM**: Scaling the core LLM from 1.5B to 7B significantly improves perceptual quality.
 
 ## Usage
-### Basic Usage
+
 ```python
-from vibevoice.modular.modeling_vibevoice_inference import VibeVoiceForConditionalGenerationInference
-from vibevoice.processor.vibevoice_processor import VibeVoiceProcessor
-import torch
-import re
 import os
-from huggingface_hub import hf_hub_download
-from typing import List, Tuple, Union, Dict, Any
+import re
+import time
 
-class VoiceMapper:
-    def __init__(self):
-        self.setup_voice_presets()
-        new_dict = {}
-        for name, path in self.voice_presets.items():
-            
-            if '_' in name:
-                name = name.split('_')[0]
-            
-            if '-' in name:
-                name = name.split('-')[-1]
+from huggingface_hub import snapshot_download
+import diffusers
+import numpy as np
+import torch
+from tqdm import tqdm
 
-            new_dict[name] = path
-        self.voice_presets.update(new_dict)
+from transformers import AutoProcessor, VibeVoiceForConditionalGeneration
+from transformers.audio_utils import load_audio_librosa
 
-    def setup_voice_presets(self):
-        REPO_ID = "yingwanghf/vibe_voice_sample"
-        REPO_TYPE = "dataset" 
-        voices_dir = os.path.join(os.path.dirname(__file__), "voice_samples")
-        os.makedirs(voices_dir, exist_ok=True)
-        audio_files = ["en-Alice_woman.wav", "en-Ben_man.wav", "en-Carter_man.wav", "en-Maya_woman.wav", "in-Samuel_man.wav"]
-        for audio in audio_files:
-            local_path = hf_hub_download(
-                repo_id=REPO_ID,
-                filename=audio,
-                repo_type=REPO_TYPE,
-                local_dir=voices_dir,
-            )
-        if not os.path.exists(voices_dir):
-            print(f"Warning: Voices directory not found at {voices_dir}")
-            self.voice_presets = {}
-            self.available_voices = {}
-            return
-        self.voice_presets = {}
-        wav_files = [f for f in os.listdir(voices_dir) 
-                    if f.lower().endswith('.wav') and os.path.isfile(os.path.join(voices_dir, f))]
-        for wav_file in wav_files:
-            name = os.path.splitext(wav_file)[0]
-            full_path = os.path.join(voices_dir, wav_file)
-            self.voice_presets[name] = full_path
-        self.voice_presets = dict(sorted(self.voice_presets.items()))
-        self.available_voices = {
-            name: path for name, path in self.voice_presets.items()
-            if os.path.exists(path)
-        }
 
-    def get_voice_path(self, speaker_name: str) -> str:
-        if speaker_name in self.voice_presets:
-            return self.voice_presets[speaker_name]
-        speaker_lower = speaker_name.lower()
-        for preset_name, path in self.voice_presets.items():
-            if preset_name.lower() in speaker_lower or speaker_lower in preset_name.lower():
-                return path
-        default_voice = list(self.voice_presets.values())[0]
-        print(f"Warning: No voice preset found for '{speaker_name}', using default voice: {default_voice}")
-        return default_voice
+# set seed for deterministic
+torch.manual_seed(42)
+np.random.seed(42)
 
-def format_conversation_to_script(conversation_data: List[Dict[str, Any]]) -> Tuple[List[str], List[str]]:
-    script_lines = []
-    speaker_ids = []
-    for turn in conversation_data:
-        role_id = turn.get("role")
-        content_parts = [item.get("text", "") for item in turn.get("content", []) if item.get("type") == "text"]
-        text = " ".join(content_parts).strip()
-        if role_id and text:
-            script_lines.append(f"Speaker {role_id}: {text}")
-            speaker_ids.append(role_id)
+model_path = "bezzam/VibeVoice-1.5B"
+sampling_rate = 24000
+max_new_tokens = None  # None for full generation
+output_dir = "./vibevoice_output"
+torch_device = "cuda" if torch.cuda.is_available() else "cpu"
+bfloat16 = False
+batch_flag = False
+voice_sample_repo = "yingwanghf/vibe_voice_sample"
 
-    return script_lines, speaker_ids
-
-def script_to_chat_template(scripts: str) -> list:
-    conversation = []
-    lines = [line.strip() for line in scripts.strip().split('\n') if line.strip()]
-    speaker_pattern = r'^Speaker\s+(\d+):\s*(.*)$'
-    current_speaker = None
-    current_text = ""
-    for line in lines:
-        try:
-            match = re.match(speaker_pattern, line, re.IGNORECASE)
-            if match:
-                if current_speaker and current_text:
-                    chat_entry = {
-                        "role": current_speaker,
-                        "content": [{"type": "text", "text": current_text.strip()}]
-                    }
-                    
-                    conversation.append(chat_entry)
-                # Start new speaker
-                current_speaker = match.group(1).strip()
-                current_text = match.group(2).strip()
-            else:
-                if current_text:
-                    current_text += " " + line
-                else:
-                    current_text = line
-        except Exception as e:
-            print(f"Error processing line '{line}': {e}")
+def input_process(conversation: list, voice_paths: list, sampling_rate: int = 24000) -> list:
+    added_voices = set()
+    for entry in conversation:
+        role = entry["role"]
+        voice_index = int(role)
+        if voice_index in added_voices:
             continue
+        else:
+            try:
+                voice_path = voice_paths[voice_index]
+                voice_content = load_audio_librosa(voice_path, sampling_rate=sampling_rate)
+                voice = {'type': 'audio', 'audio': voice_content}
+                entry["content"].append(voice)
+                added_voices.add(voice_index)
+            except IndexError:
+                print(f"Warning: No audio path provided for role '{role}'. Skipping audio assignment for this entry.")
 
-    if current_speaker and current_text:
-        chat_entry = {
-            "role": current_speaker,
-            "content": [{"type": "text", "text": current_text.strip()}]
-        }
-        
-        conversation.append(chat_entry)
     return conversation
 
-def input_process(txt_content: str, voices: List[str]) -> Tuple[str, List[str]]:
-    voice_mapper = VoiceMapper()
-    scripts, speaker_numbers = format_conversation_to_script(txt_content)
-
-    full_script = '\n'.join(scripts)
-
-    speaker_name_mapping = {}
-    speaker_names_list = voices
-    for i, name in enumerate(speaker_names_list):
-        speaker_name_mapping[str(i)] = name
-    voice_samples = []
-
-    unique_speaker_numbers = []
-    seen = set()
-    for speaker_num in speaker_numbers:
-        if speaker_num not in seen:
-            unique_speaker_numbers.append(speaker_num)
-            seen.add(speaker_num)
-
-    for speaker_num in unique_speaker_numbers:
-        speaker_name = speaker_name_mapping.get(speaker_num, f"Speaker {speaker_num}")
-        voice_path = voice_mapper.get_voice_path(speaker_name)
-        voice_samples.append(voice_path)
-
-    return full_script, voice_samples
-
 def main():
-    model_path = "microsoft/VibeVoice-1.5b"
-    cfg_scale = 1.3
-    generated_audio_path = os.path.join(os.path.dirname(__file__), "outputs", "generated_audio.wav")
-    os.makedirs(os.path.dirname(generated_audio_path), exist_ok=True)
-    # Please follow the format below to add new scripts and voices
-    conversation = [
-	    {"role": "0", "content": [{"type": "text", "text": "Hello, how are you?"}]},
-	    {"role": "1", "content": [{"type": "text", "text": "I'm fine, thank you! And you?"}]},
-	    {"role": "0", "content": [{"type": "text", "text": "I'm doing well, thanks for asking."}]},
-	    {"role": "1", "content": [{"type": "text", "text": "That's great to hear. What have you been up to lately?"}]},
-	    {"role": "0", "content": [{"type": "text", "text": "Just working and spending time with family."}]},
-	]
+    repo_dir = snapshot_download(
+        repo_id=voice_sample_repo,
+        repo_type="dataset",
+    )
 
     # Only five voices for use
     # 'en-Alice_woman', 'en-Ben_man', 'en-Carter_man', 'en-Maya_woman', 'in-Samuel_man'
-    voices = ["en-Alice_woman", "en-Carter_man"]
-    full_script, voice_samples = input_process(conversation, voices)
-
-    processor = VibeVoiceProcessor.from_pretrained(model_path)
-    model = VibeVoiceForConditionalGenerationInference.from_pretrained(
-        model_path,
-        torch_dtype=torch.bfloat16,
-        device_map='cuda',
-        attn_implementation="flash_attention_2"
-    )
-
-    model.eval()
-    model.set_ddpm_inference_steps(num_steps=10)
-    inputs = processor(
-        text=[full_script], 
-        voice_samples=[voice_samples], 
-        padding=True,
-        return_tensors="pt",
-        return_attention_mask=True,
-    )
-
-    outputs = model.generate(
-        **inputs,
-        max_new_tokens=None,
-        cfg_scale=cfg_scale,
-        tokenizer=processor.tokenizer,
-        generation_config={'do_sample': False},
-        verbose=True,
-    )
-
-    processor.save_audio(
-        outputs.speech_outputs[0],  # First (and only) batch item
-        output_path=generated_audio_path,
-    )
-
-if __name__ == "__main__":
-    main()
-```
-
-### Batch Usage
-```python
-from vibevoice.modular.modeling_vibevoice_inference import VibeVoiceForConditionalGenerationInference
-from vibevoice.processor.vibevoice_processor import VibeVoiceProcessor
-import torch
-import re
-import os
-from huggingface_hub import hf_hub_download
-from typing import List, Tuple, Union, Dict, Any
-from transformers import set_seed
-
-class VoiceMapper:  
-    def __init__(self):
-        self.setup_voice_presets()
-        new_dict = {}
-        for name, path in self.voice_presets.items():
-            
-            if '_' in name:
-                name = name.split('_')[0]
-            
-            if '-' in name:
-                name = name.split('-')[-1]
-
-            new_dict[name] = path
-        self.voice_presets.update(new_dict)
-
-    def setup_voice_presets(self):
-        REPO_ID = "yingwanghf/vibe_voice_sample"
-        REPO_TYPE = "dataset" 
-        voices_dir = os.path.join(os.path.dirname(__file__), "voice_samples")
-        os.makedirs(voices_dir, exist_ok=True)
-        audio_files = ["en-Alice_woman.wav", "en-Ben_man.wav", "en-Carter_man.wav", "en-Maya_woman.wav", "in-Samuel_man.wav"]
-        for audio in audio_files:
-            local_path = hf_hub_download(
-                repo_id=REPO_ID,
-                filename=audio,
-                repo_type=REPO_TYPE,
-                local_dir=voices_dir,
-            )
-        if not os.path.exists(voices_dir):
-            print(f"Warning: Voices directory not found at {voices_dir}")
-            self.voice_presets = {}
-            self.available_voices = {}
-            return
-        self.voice_presets = {}
-        wav_files = [f for f in os.listdir(voices_dir) 
-                    if f.lower().endswith('.wav') and os.path.isfile(os.path.join(voices_dir, f))]
-        for wav_file in wav_files:
-            name = os.path.splitext(wav_file)[0]
-            full_path = os.path.join(voices_dir, wav_file)
-            self.voice_presets[name] = full_path
-        self.voice_presets = dict(sorted(self.voice_presets.items()))
-        self.available_voices = {
-            name: path for name, path in self.voice_presets.items()
-            if os.path.exists(path)
-        }
-
-    def get_voice_path(self, speaker_name: str) -> str:
-        if speaker_name in self.voice_presets:
-            return self.voice_presets[speaker_name]
-        speaker_lower = speaker_name.lower()
-        for preset_name, path in self.voice_presets.items():
-            if preset_name.lower() in speaker_lower or speaker_lower in preset_name.lower():
-                return path
-        default_voice = list(self.voice_presets.values())[0]
-        print(f"Warning: No voice preset found for '{speaker_name}', using default voice: {default_voice}")
-        return default_voice
-
-def format_conversation_to_script(conversation_data: List[Dict[str, Any]]) -> Tuple[List[str], List[str]]:
-    script_lines = []
-    speaker_ids = []
-    for turn in conversation_data:
-        role_id = turn.get("role")
-        content_parts = [item.get("text", "") for item in turn.get("content", []) if item.get("type") == "text"]
-        text = " ".join(content_parts).strip()
-        if role_id and text:
-            script_lines.append(f"Speaker {role_id}: {text}")
-            speaker_ids.append(role_id)
-
-    return script_lines, speaker_ids
-
-def script_to_chat_template(scripts: str) -> list:
-    conversation = []
-    lines = [line.strip() for line in scripts.strip().split('\n') if line.strip()]
-    speaker_pattern = r'^Speaker\s+(\d+):\s*(.*)$'
-    current_speaker = None
-    current_text = ""
-    for line in lines:
-        try:
-            match = re.match(speaker_pattern, line, re.IGNORECASE)
-            if match:
-                if current_speaker and current_text:
-                    chat_entry = {
-                        "role": current_speaker,
-                        "content": [{"type": "text", "text": current_text.strip()}]
-                    }
-                    
-                    conversation.append(chat_entry)
-                # Start new speaker
-                current_speaker = match.group(1).strip()
-                current_text = match.group(2).strip()
-            else:
-                if current_text:
-                    current_text += " " + line
-                else:
-                    current_text = line
-        except Exception as e:
-            print(f"Error processing line '{line}': {e}")
-            continue
-
-    if current_speaker and current_text:
-        chat_entry = {
-            "role": current_speaker,
-            "content": [{"type": "text", "text": current_text.strip()}]
-        }
-        
-        conversation.append(chat_entry)
-    return conversation
-
-def input_process(txt_content: str, voices: List[str]) -> Tuple[str, List[str]]:
-    voice_mapper = VoiceMapper()
-    scripts, speaker_numbers = format_conversation_to_script(txt_content)
-
-    full_script = '\n'.join(scripts)
-
-    speaker_name_mapping = {}
-    speaker_names_list = voices
-    for i, name in enumerate(speaker_names_list):
-        speaker_name_mapping[str(i)] = name
-    voice_samples = []
-
-    unique_speaker_numbers = []
-    seen = set()
-    for speaker_num in speaker_numbers:
-        if speaker_num not in seen:
-            unique_speaker_numbers.append(speaker_num)
-            seen.add(speaker_num)
-
-    for speaker_num in unique_speaker_numbers:
-        speaker_name = speaker_name_mapping.get(speaker_num, f"Speaker {speaker_num}")
-        voice_path = voice_mapper.get_voice_path(speaker_name)
-        voice_samples.append(voice_path)
-
-    return full_script, voice_samples
-
-def process_batch(batch, model, processor, cfg_scale):
-
-    batch_save_names = batch['save_names']
-    batch_scripts = batch['scripts']
-    batch_voice_samples = batch['voice_samples']
-    
-    inputs = processor(
-        text=batch_scripts,
-        voice_samples=batch_voice_samples,
-        padding=True,
-        return_tensors="pt",
-        return_attention_mask=True,
-    )
-
-    device = next(model.parameters()).device
-    for key in inputs:
-        if isinstance(inputs[key], torch.Tensor):
-            inputs[key] = inputs[key].to(device)
-
-    outputs = model.generate(
-        **inputs,
-        max_new_tokens=None,
-        cfg_scale=cfg_scale,
-        tokenizer=processor.tokenizer,
-        generation_config={'do_sample': False, 'temperature': 0.95, 'top_p': 0.95, 'top_k': 0},
-        max_length_times=2,
-    )
-
-    reach_max_step_sample = outputs.reach_max_step_sample if hasattr(outputs, 'reach_max_step_sample') else None
-
-    original_failed_indices = []
-    retry_count = 0
-    max_retries = 5
-    
-    while reach_max_step_sample is not None and reach_max_step_sample.any() and retry_count < max_retries:
-        retry_count += 1
-        current_failed_indices = torch.where(reach_max_step_sample)[0].tolist()
-        
-        if original_failed_indices:
-            failed_indices = [original_failed_indices[idx] for idx in current_failed_indices]
-            original_failed_indices = failed_indices
-        else:
-            failed_indices = current_failed_indices
-            original_failed_indices = failed_indices
-        
-        retry_seed = 42 + retry_count * 1000 
-        set_seed(retry_seed)
-
-        failed_scripts = [batch_scripts[idx] for idx in failed_indices]
-        failed_voice_samples = [batch_voice_samples[idx] for idx in failed_indices]
-        
-        retry_inputs = processor(
-            text=failed_scripts,
-            voice_samples=failed_voice_samples,
-            padding=True,
-            return_tensors="pt",
-            return_attention_mask=True,
-        )
-        
-        for key in retry_inputs:
-            if isinstance(retry_inputs[key], torch.Tensor):
-                retry_inputs[key] = retry_inputs[key].to(device)
-        
-        retry_outputs = model.generate(
-            **retry_inputs,
-            max_new_tokens=None,
-            cfg_scale=cfg_scale,
-            tokenizer=processor.tokenizer,
-            generation_config={'do_sample': False, 'temperature': 0.95, 'top_p': 0.95, 'top_k': 0},
-            max_length_times=2,
-            verbose=True, 
-        )
-
-        for i, original_idx in enumerate(failed_indices):
-            outputs.speech_outputs[original_idx] = retry_outputs.speech_outputs[i]
-        
-        reach_max_step_sample = retry_outputs.reach_max_step_sample if hasattr(retry_outputs, 'reach_max_step_sample') else None
-    
-    set_seed(42)
-
-    for i, save_name in enumerate(batch_save_names):
-        output_path = os.path.join(os.path.dirname(__file__), "outputs", f"{save_name}.wav")
-        os.makedirs(os.path.dirname(output_path), exist_ok=True)
-        processor.save_audio(
-            outputs.speech_outputs[i],
-            output_path=output_path,
-        )
-    
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
-
-def main():
-    model_path = "microsoft/VibeVoice-1.5b"
-    cfg_scale = 1.3
-    # Please follow the format below to add new scripts and voices
+    voice_fn_1 = [
+        "en-Alice_woman.wav", 
+        "en-Ben_man.wav"
+    ]
+    # Please follow the format
     conversation_1 = [
 	    {"role": "0", "content": [{"type": "text", "text": "Hello, how are you?"}]},
 	    {"role": "1", "content": [{"type": "text", "text": "I'm fine, thank you! And you?"}]},
 	    {"role": "0", "content": [{"type": "text", "text": "I'm doing well, thanks for asking."}]},
 	    {"role": "1", "content": [{"type": "text", "text": "That's great to hear. What have you been up to lately?"}]},
-	    {"role": "0", "content": [{"type": "text", "text": "Just working and spending time with family."}]},
+	    {"role": "0", "content": [{"type": "text", "text": "Just working and spending time with family."}]}
 	]
+    voice_paths_1 = [f"{repo_dir}/{fn}" for fn in voice_fn_1]
+    conversation_1 = input_process(conversation_1, voice_paths_1, sampling_rate=sampling_rate)
 
-    # Only five voices for use
-    # 'en-Alice_woman', 'en-Ben_man', 'en-Carter_man', 'en-Maya_woman', 'in-Samuel_man'
-    voices_1 = ["en-Alice_woman", "en-Ben_man"]
-    full_script_1, voice_samples_1 = input_process(conversation_1, voices_1)
+    voice_fn_2 = [
+        "en-Maya_woman.wav", 
+        "en-Carter_man.wav"
+    ]
 
-    # Please follow the format below to add new scripts and voices
     conversation_2 = [
 	    {"role": "0", "content": [{"type": "text", "text": "Hey, remember 'See You Again'?"}]},
 	    {"role": "1", "content": [{"type": "text", "text": "Yeah… from Furious 7, right? That song always hits deep."}]},
@@ -481,33 +104,109 @@ def main():
 	    {"role": "0", "content": [{"type": "text", "text": "It's been a long day… without you, my friend. And I'll tell you all about it when I see you again…"}]},
 	    {"role": "1", "content": [{"type": "text", "text": "Wow… that line. Every time."}]},
 	]
+    voice_paths_2 = [f"{repo_dir}/{fn}" for fn in voice_fn_2]
+    conversation_2 = input_process(conversation_2, voice_paths_2, sampling_rate=sampling_rate)
 
-    # Only five voices for use
-    # 'en-Alice_woman', 'en-Ben_man', 'en-Carter_man', 'en-Maya_woman', 'in-Samuel_man'
-    voices_2 = ["en-Carter_man", "en-Maya_woman"]
-    full_script_2, voice_samples_2 = input_process(conversation_2, voices_2)
+    if batch_flag:
+        conversations = [conversation_1, conversation_2]
+    else:
+        conversations = [conversation_1]
 
-    batch_data = {
-        'save_names': ['conversation_1', 'conversation_2'],
-        'scripts': [full_script_1, full_script_2],
-        'voice_samples': [voice_samples_1, voice_samples_2],
-    }
-
-    set_seed(42)
-
-    processor = VibeVoiceProcessor.from_pretrained(model_path)
-    model = VibeVoiceForConditionalGenerationInference.from_pretrained(
+    processor = AutoProcessor.from_pretrained(model_path)
+    model = VibeVoiceForConditionalGeneration.from_pretrained(
         model_path,
-        torch_dtype=torch.bfloat16,
-        device_map='cuda',
-        attn_implementation="flash_attention_2"
+        dtype=torch.bfloat16 if bfloat16 else None,
+        device_map=torch_device,
+    ).eval()
+
+    # determine model dtype
+    model_dtype = next(model.parameters()).dtype
+
+    # Prepare inputs for the model
+    inputs = processor.apply_chat_template(
+        conversations, 
+        tokenize=True,
+        return_dict=True
+    ).to(torch_device, dtype=model_dtype)
+    print("\ninput_ids shape : ", inputs["input_ids"].shape)
+
+    # Generate audio
+    start_time = time.time()
+
+    # Noise scheduler from diffusers library
+    noise_scheduler = getattr(diffusers, model.generation_config.noise_scheduler)(
+        **model.generation_config.noise_scheduler_config
     )
 
-    model.eval()
-    model.set_ddpm_inference_steps(num_steps=10)
+    # Define a callback to monitor the progress of the generation
+    completed_samples = set()
+    with tqdm(desc="Generating") as pbar:
+        def monitor_progress(p_batch):
+            # p_batch format: [current_step, max_step, completion_step] for each sample
+            finished_samples = (p_batch[:, 0] == p_batch[:, 1]).nonzero(as_tuple=False).squeeze(1)
+            if finished_samples.numel() > 0:
+                for sample_idx in finished_samples.tolist():
+                    if sample_idx not in completed_samples:
+                        completed_samples.add(sample_idx)
+                        completion_step = int(p_batch[sample_idx, 2])
+                        print(f"Sample {sample_idx} completed at step {completion_step}", flush=True)
 
-    process_batch(batch_data, model, processor, cfg_scale)
+            active_samples = p_batch[:, 0] < p_batch[:, 1]
+            if active_samples.any():
+                active_progress = p_batch[active_samples]
+                max_active_idx = torch.argmax(active_progress[:, 0])
+                p = active_progress[max_active_idx].detach().cpu()
+            else:
+                p = p_batch[0].detach().cpu()
+
+            pbar.total = int(p[1])
+            pbar.n = int(p[0])
+            pbar.update()
+
+        # Generate!
+        outputs = model.generate(
+            **inputs,
+            max_new_tokens=max_new_tokens,
+            noise_scheduler=noise_scheduler,
+            monitor_progress=monitor_progress,
+            return_dict_in_generate=True,
+        )
+    generation_time = time.time() - start_time
+    print(f"Generation time: {generation_time:.2f} seconds")
+
+    # Calculate audio duration and additional metrics
+    if outputs.speech_outputs and outputs.speech_outputs[0] is not None:
+        audio_samples = outputs.speech_outputs[0].shape[-1] if len(outputs.speech_outputs[0].shape) > 0 else len(outputs.speech_outputs[0])
+        audio_duration = audio_samples / sampling_rate
+        rtf = generation_time / audio_duration if audio_duration > 0 else float('inf')
+
+        print(f"Generated audio duration: {audio_duration:.2f} seconds")
+        print(f"RTF (Real Time Factor): {rtf:.2f}x")
+    else:
+        print("No audio output generated")
+
+    # Calculate token metrics
+    input_tokens = inputs['input_ids'].shape[1]  # Number of input tokens
+    output_tokens = outputs.sequences.shape[1]  # Total tokens (input + generated)
+    generated_tokens = output_tokens - input_tokens
+
+    print(f"Prefilling tokens: {input_tokens}")
+    print(f"Generated tokens: {generated_tokens}")
+    print(f"Total tokens: {output_tokens}")
+
+    # Save output (processor handles device internally)
+    txt_filename = "conversation"
+    os.makedirs(output_dir, exist_ok=True)
+
+    for i, speech in enumerate(outputs.speech_outputs):
+        output_path = os.path.join(output_dir, f"{txt_filename}_generated_{i}.wav")
+        processor.save_audio(
+            speech,
+            output_path,
+        )
+        print(f"Saved output to {output_path}")
 
 if __name__ == "__main__":
     main()
 ```
+
